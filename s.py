@@ -972,20 +972,8 @@ def user_panel():
 
 
 async def user_reply(update, context, *args, **kwargs):
-    """پیام قبلی پنل کاربر را قبل از نمایش پیام جدید حذف می‌کند."""
-    old_id = context.user_data.get("last_user_panel_message_id")
-    if old_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=old_id
-            )
-        except Exception:
-            pass
-
-    message = await update.message.reply_text(*args, **kwargs)
-    context.user_data["last_user_panel_message_id"] = message.message_id
-    return message
+    """ارسال پیام معمولی به کاربر؛ پیام‌های قبلی حذف نمی‌شوند."""
+    return await update.message.reply_text(*args, **kwargs)
 
 
 # =========================================================
@@ -1540,30 +1528,27 @@ async def callbacks(
 
         plan = PLANS.get(order["plan_key"], {"name": order["plan_key"], "gb": 0, "days": 0})
 
-        context.user_data["awaiting_config_name_order_id"] = order_id
+        context.user_data["awaiting_config_name_order_id"] = None
 
         await q.edit_message_text(
             f"""
-✅ <b>پرداخت با کیف پول موفق بود</b>
+✅ <b>پرداخت با کیف پول با موفقیت انجام شد</b>
 
 ━━━━━━━━━━━━━━━━━━
 
 🧾 سفارش: <code>#{order_id}</code>
-⚡ سرویس: <b>{escape(plan['name'])}</b>
 💰 مبلغ پرداخت‌شده: <b>{format_price(order['amount'])}</b>
 💳 موجودی جدید: <b>{format_price(new_balance)}</b>
 
 ⏳ پرداخت ثبت شد و سفارش برای تحویل کانفیگ در اختیار ادمین قرار گرفت.
 
-بعد از تحویل، کانفیگ برایت ارسال می‌شود.
+📌 برای انتخاب نام کانفیگ، روی «ادامه» بزن.
 """,
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[back_button("home")]])
-        )
-
-        await q.message.reply_text(
-            "🏷 <b>یک نام برای کانفیگت انتخاب کن</b>\n\nمثلاً: <code>آریا</code> یا <code>گوشی من</code>\n\nاین نام در «📡 سرویس های من» و پیام‌های مربوط به کانفیگ نمایش داده می‌شود.",
-            parse_mode=ParseMode.HTML
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ ادامه و انتخاب نام کانفیگ", callback_data=f"config_name_continue:{order_id}")],
+                [back_button("home")]
+            ])
         )
 
         try:
@@ -1695,6 +1680,8 @@ async def callbacks(
         context.user_data["awaiting_wallet_receipt"] = False
         context.user_data["awaiting_wallet_amount"] = True
 
+        context.user_data["awaiting_wallet_amount"] = False
+
         await q.edit_message_text(
             """
 <b>✦ Kaletek</b>
@@ -1711,6 +1698,35 @@ async def callbacks(
 ━━━━━━━━━━━━━━━━━━
 
 🔹 مبلغ را با عدد وارد کن.
+🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ ادامه", callback_data="wallet_topup_continue")],
+                [back_button("profile")]
+            ])
+        )
+        return
+
+    # =====================================================
+    # WALLET TOP-UP CONTINUE
+    # =====================================================
+
+    if data == "wallet_topup_continue":
+        context.user_data["awaiting_wallet_amount"] = True
+
+        await q.edit_message_text(
+            """
+<b>✦ Kaletek</b>
+
+💳 <b>مبلغ شارژ کیف پول</b>
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ موردنظر را به تومان وارد کن.
+
+مثال:
+<b>50,000 تومان</b>
+
 🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
 """,
             parse_mode=ParseMode.HTML,
@@ -1760,6 +1776,50 @@ async def callbacks(
 🔎 بعد از دریافت، رسید برای بررسی ادمین ارسال می‌شود.
 """,
             parse_mode=ParseMode.HTML
+        )
+        return
+
+    # =====================================================
+    # CONFIG NAME CONTINUE
+    # =====================================================
+
+    if data.startswith("config_name_continue:"):
+        try:
+            order_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("❌ سفارش نامعتبر است.", show_alert=True)
+            return
+
+        con = db()
+        order = con.execute(
+            "SELECT * FROM orders WHERE id=? AND user_id=?",
+            (order_id, user_id)
+        ).fetchone()
+        con.close()
+
+        if not order:
+            await q.answer("❌ سفارش پیدا نشد.", show_alert=True)
+            return
+
+        context.user_data["awaiting_config_name_order_id"] = order_id
+
+        await q.edit_message_text(
+            """
+🏷 <b>نام کانفیگت را انتخاب کن</b>
+
+━━━━━━━━━━━━━━━━━━
+
+یک نام کوتاه و دلخواه برای کانفیگت وارد کن.
+
+مثال:
+<b>ali1370</b>
+
+📌 این نام در «📡 سرویس های من» و پیام‌های مربوط به کانفیگ نمایش داده می‌شود.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [back_button("home")]
+            ])
         )
         return
 
@@ -2528,22 +2588,21 @@ async def callbacks(
             await context.bot.send_message(
                 chat_id=receipt["user_id"],
                 text=f"""
-✅ <b>پرداخت شما تأیید شد</b>
+✦ <b>Kaletek</b>
 
+✅ <b>رسید پرداخت تأیید شد</b>
 ━━━━━━━━━━━━━━━━━━
 
-🧾 سفارش:
-<code>#{receipt['order_id']}</code>
+🧾 سفارش: <code>#{receipt['order_id']}</code>
+💰 مبلغ تأییدشده: <b>{format_price(receipt['amount'])}</b>
+💳 موجودی کیف پول: <b>{format_price(new_balance)}</b>
 
-💰 مبلغ اضافه‌شده:
-<b>{format_price(receipt['amount'])}</b>
-
-💳 موجودی جدید کیف پول:
-<b>{format_price(new_balance)}</b>
-
-مبلغ پرداختی با موفقیت به کیف پول شما اضافه شد.
+📌 حالا برای انتخاب نام کانفیگ، روی «ادامه» بزن.
 """,
-                parse_mode=ParseMode.HTML
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("▶️ ادامه و انتخاب نام کانفیگ", callback_data=f"config_name_continue:{receipt['order_id']}")]
+                ])
             )
         except Exception:
             pass
@@ -2837,13 +2896,14 @@ async def photo_handler(
 
 ⏳ رسید برای بررسی ادمین ارسال شد.
 
-🏷 <b>حالا یک نام برای کانفیگت انتخاب کن:</b>
-مثلاً <code>آریا</code> یا <code>گوشی من</code>
+📌 بعد از تأیید رسید، نام کانفیگت را انتخاب کن.
 
-این نام بعداً در پیام‌ها و بخش «📡 سرویس های من» نمایش داده می‌شود.
+برای ادامه روی دکمه زیر بزن.
 """,
             parse_mode=ParseMode.HTML,
-            reply_markup=user_panel()
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ ادامه و انتخاب نام کانفیگ", callback_data=f"config_name_continue:{order_id}")]
+            ])
         )
 
         plan = PLANS.get(
