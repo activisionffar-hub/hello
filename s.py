@@ -76,6 +76,52 @@ PLANS = {
 }
 
 
+DIRECT_PRICES = {"normal": 1500, "vip": 4000}
+DIRECT_NAMES = {"normal": "دایرکت معمولی", "vip": "دایرکت VIP"}
+
+
+def get_plan(plan_key):
+    if plan_key in PLANS:
+        return PLANS[plan_key]
+    parts = str(plan_key).split("_")
+    if len(parts) == 3 and parts[0] == "direct" and parts[1] in DIRECT_PRICES:
+        try:
+            gb = int(parts[2])
+        except ValueError:
+            return None
+        if gb > 0:
+            return {
+                "name": f"{gb} گیگ",
+                "gb": gb,
+                "days": 30,
+                "price": gb * DIRECT_PRICES[parts[1]],
+                "service_type": DIRECT_NAMES[parts[1]],
+                "tier": parts[1],
+            }
+    return None
+
+
+def direct_plan_key(tier, gb):
+    return f"direct_{tier}_{int(gb)}"
+
+
+def create_direct_order(user_id, tier, gb):
+    plan_key = direct_plan_key(tier, gb)
+    plan = get_plan(plan_key)
+    if not plan:
+        raise ValueError("invalid direct plan")
+    con = db()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO orders (user_id, plan_key, amount, created_at) VALUES (?, ?, ?, ?)",
+        (user_id, plan_key, plan["price"], datetime.now().isoformat(timespec="seconds"))
+    )
+    order_id = cur.lastrowid
+    con.commit()
+    con.close()
+    return order_id
+
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -333,7 +379,7 @@ def get_services(user_id):
 
 
 def create_order(user_id, plan_key):
-    plan = PLANS[plan_key]
+    plan = get_plan(plan_key)
 
     con = db()
     cur = con.cursor()
@@ -415,7 +461,7 @@ def get_order_config_name(user_id, plan_key):
 
 
 def create_service(user_id, plan_key, config, config_name=None):
-    plan = PLANS[plan_key]
+    plan = get_plan(plan_key)
     now = datetime.now()
     expires = now + timedelta(days=plan["days"])
 
@@ -1005,22 +1051,49 @@ async def user_reply(update, context, *args, **kwargs):
 # INLINE PLANS
 # =========================================================
 
-def plans_menu(prefix="plan"):
-    buttons = []
+def service_type_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔐 سرویس V2Ray", callback_data="service:v2ray")],
+        [back_button("home")],
+    ])
 
+
+def direct_tier_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ دایرکت معمولی", callback_data="tier:normal")],
+        [InlineKeyboardButton("👑 دایرکت VIP", callback_data="tier:vip")],
+        [back_button("service:v2ray")],
+    ])
+
+
+def volume_menu(tier):
+    price_per_gb = DIRECT_PRICES[tier]
+    rows = []
+    for gb in (5, 10, 30):
+        rows.append([
+            InlineKeyboardButton(
+                f"📦 {gb} گیگ • {format_price(gb * price_per_gb)} تومان",
+                callback_data=f"volume:{tier}:{gb}"
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton("✏️ حجم دلخواه", callback_data=f"custom_volume:{tier}")
+    ])
+    rows.append([back_button("service:v2ray")])
+    return InlineKeyboardMarkup(rows)
+
+
+def plans_menu(prefix="plan"):
+    # Legacy menu kept for old orders/renewals.
+    buttons = []
     for key, plan in PLANS.items():
         buttons.append([
             InlineKeyboardButton(
-                f"⚡ {plan['name']} • "
-                f"{format_price(plan['price'])}",
+                f"⚡ {plan['name']} • {format_price(plan['price'])}",
                 callback_data=f"{prefix}:{key}"
             )
         ])
-
-    buttons.append([
-        back_button("home")
-    ])
-
+    buttons.append([back_button("home")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1126,10 +1199,7 @@ def services_text(user_id):
             else "🔴 غیرفعال"
         )
 
-        plan = PLANS.get(
-            service["plan_key"],
-            {"name": service["plan_key"]}
-        )
+        plan = get_plan(service["plan_key"]) or {"name": service["plan_key"]}
 
         lines.extend([
             f"🛰 <b>{plan['name']}</b>",
@@ -1181,10 +1251,7 @@ def profile_text(user_id):
         now = datetime.now()
 
         for service in active_services:
-            plan = PLANS.get(
-                service["plan_key"],
-                {"name": service["plan_key"]}
-            )
+            plan = get_plan(service["plan_key"]) or {"name": service["plan_key"]}
             try:
                 purchased_at = datetime.fromisoformat(service["purchased_at"])
                 elapsed_days = max(0, (now - purchased_at).days)
@@ -1403,6 +1470,8 @@ async def callbacks(
         context.user_data["awaiting_receipt_order_id"] = None
         context.user_data["awaiting_wallet_amount"] = False
         context.user_data["awaiting_wallet_receipt"] = False
+        context.user_data["awaiting_config_name_order_id"] = None
+        context.user_data["awaiting_custom_gb_tier"] = None
 
         # ادمین هیچ وقت پنل مشتری نبیند
         if user_id == ADMIN_ID:
@@ -1435,20 +1504,105 @@ async def callbacks(
     # =====================================================
 
     if data == "buy":
+        context.user_data["awaiting_config_name_order_id"] = None
+        context.user_data["awaiting_custom_gb_tier"] = None
         await q.edit_message_text(
             """
 🛒 <b>فروشگاه اشتراک‌ها</b>
+━━━━━━━━━━━━━━━━━━
+
+🔹 نوع سرویس را انتخاب کن:
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=service_type_menu()
+        )
+        return
+
+    if data == "service:v2ray":
+        context.user_data["awaiting_custom_gb_tier"] = None
+        await q.edit_message_text(
+            """
+🔐 <b>سرویس V2Ray</b>
+━━━━━━━━━━━━━━━━━━
+
+نوع سرویس را انتخاب کن:
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=direct_tier_menu()
+        )
+        return
+
+    if data in ("tier:normal", "tier:vip"):
+        tier = data.split(":", 1)[1]
+        await q.edit_message_text(
+            f"""
+{"⚡" if tier == "normal" else "👑"} <b>{DIRECT_NAMES[tier]}</b>
+━━━━━━━━━━━━━━━━━━
+
+💰 قیمت هر گیگ:
+<b>{format_price(DIRECT_PRICES[tier])} تومان</b>
+
+📦 حجم موردنظر را انتخاب کن:
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=volume_menu(tier)
+        )
+        return
+
+    if data.startswith("volume:"):
+        _, tier, gb_text = data.split(":", 2)
+        gb = int(gb_text)
+        order_id = create_direct_order(user_id, tier, gb)
+        plan = get_plan(direct_plan_key(tier, gb))
+        await q.edit_message_text(
+            f"""
+🧾 <b>سفارش #{order_id}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-پلن موردنظر خودت را انتخاب کن:
+📦 حجم:
+<b>{gb} GB</b>
 
-⚡ تحویل سریع
-🔐 سرویس اختصاصی
-📅 اعتبار ۳۰ روزه
+⏱ اعتبار:
+<b>30 روز</b>
+
+💰 مبلغ:
+<b>{format_price(plan["price"])} تومان</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 اگر موجودی کیف پولت کافی باشد، می‌توانی مستقیم از کیف پول پرداخت کنی.
+
+💳 یا می‌توانی با کارت پرداخت کنی و رسید بفرستی.
 """,
             parse_mode=ParseMode.HTML,
-            reply_markup=plans_menu("plan")
+            reply_markup=order_payment_keyboard(order_id, include_wallet=True)
+        )
+        return
+
+    if data.startswith("custom_volume:"):
+        tier = data.split(":", 1)[1]
+        context.user_data["awaiting_custom_gb_tier"] = tier
+        await q.edit_message_text(
+            f"""
+✏️ <b>حجم دلخواه</b>
+━━━━━━━━━━━━━━━━━━
+
+حجم موردنظرت را به گیگابایت وارد کن.
+
+مثال:
+<b>25</b>
+
+💰 قیمت هر گیگ:
+<b>{format_price(DIRECT_PRICES[tier])} تومان</b>
+
+🔹 حداقل: 1 GB
+🔹 حداکثر: 1000 GB
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ بازگشت", callback_data="service:v2ray")]
+            ])
         )
         return
 
@@ -1458,7 +1612,7 @@ async def callbacks(
 
     if data.startswith("plan:"):
         plan_key = data.split(":", 1)[1]
-        plan = PLANS.get(plan_key)
+        plan = get_plan(plan_key)
 
         if not plan:
             return
@@ -1551,7 +1705,7 @@ async def callbacks(
             await q.answer("⚠️ این سفارش قبلاً پردازش شده است.", show_alert=True)
             return
 
-        plan = PLANS.get(order["plan_key"], {"name": order["plan_key"], "gb": 0, "days": 0})
+        plan = get_plan(order["plan_key"]) or {"name": order["plan_key"], "gb": 0, "days": 0}
 
         context.user_data["awaiting_config_name_order_id"] = None
 
@@ -1874,7 +2028,7 @@ async def callbacks(
             await q.answer("❌ سرویس پیدا نشد.", show_alert=True)
             return
 
-        plan = PLANS.get(service["plan_key"], {"name": service["plan_key"]})
+        plan = get_plan(service["plan_key"]) or {"name": service["plan_key"]}
         await q.answer("📤 کانفیگ دوباره ارسال شد.")
         await q.message.reply_text(
             f"""
@@ -1981,7 +2135,7 @@ async def callbacks(
 
     if data.startswith("renewplan:"):
         plan_key = data.split(":", 1)[1]
-        plan = PLANS.get(plan_key)
+        plan = get_plan(plan_key)
 
         if not plan:
             return
@@ -2339,10 +2493,7 @@ async def callbacks(
             ]
 
             for row in rows:
-                plan = PLANS.get(
-                    row["plan_key"],
-                    {"name": row["plan_key"]}
-                )
+                plan = get_plan(row["plan_key"]) or {"name": row["plan_key"]}
 
                 lines.append(
                     f"🧾 <b>#{row['id']}</b>\n"
@@ -2446,10 +2597,7 @@ async def callbacks(
         ]
 
         for row in rows:
-            plan = PLANS.get(
-                row["plan_key"],
-                {"name": row["plan_key"]}
-            )
+            plan = get_plan(row["plan_key"]) or {"name": row["plan_key"]}
 
             status = (
                 "🟢 فعال"
@@ -2931,10 +3079,7 @@ async def photo_handler(
             parse_mode=ParseMode.HTML
         )
 
-        plan = PLANS.get(
-            order["plan_key"],
-            {"name": order["plan_key"]}
-        )
+        plan = get_plan(order["plan_key"]) or {"name": order["plan_key"]}
 
         username = (
             f"@{update.effective_user.username}"
@@ -3186,7 +3331,7 @@ async def text_handler(
             )
             return
 
-        config_name = get_order_config_name(target_user_id, plan_key) or PLANS[plan_key]["name"]
+        config_name = get_order_config_name(target_user_id, plan_key) or (get_plan(plan_key) or {"name": plan_key})["name"]
 
         service_id, code = create_service(
             target_user_id,
@@ -3197,7 +3342,7 @@ async def text_handler(
 
         context.user_data["awaiting_delivery"] = False
 
-        plan = PLANS[plan_key]
+        plan = get_plan(plan_key)
 
         await update.message.reply_text(
             f"""
@@ -3267,25 +3412,78 @@ async def text_handler(
     ensure_user(update.effective_user)
 
     # =====================================================
+    # PANEL BUTTONS CANCEL PENDING CONFIG-NAME INPUT
+    # =====================================================
+
+    panel_buttons = {
+        "👤 پروفایل و کیف پول", "🛒 فروشگاه اشتراک‌ها", "📡 سرویس های من",
+        "🎁 دعوت و دریافت رایگان", "📖 آموزش و راهنما", "🛟 تماس با پشتیبانی",
+        "💰 شارژ کیف پول"
+    }
+
+    if text in panel_buttons:
+        context.user_data["awaiting_config_name_order_id"] = None
+        context.user_data["awaiting_custom_gb_tier"] = None
+
+    # =====================================================
+    # CUSTOM DIRECT VOLUME INPUT
+    # =====================================================
+
+    if context.user_data.get("awaiting_custom_gb_tier") and text not in panel_buttons:
+        tier = context.user_data.get("awaiting_custom_gb_tier")
+        try:
+            gb = int(text.replace(",", "").replace("٬", "").replace(" ", "").strip())
+        except ValueError:
+            await update.message.reply_text(
+                "❌ حجم نامعتبر است. فقط عدد وارد کن.\n\nمثال: <b>25</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if gb < 1 or gb > 1000:
+            await update.message.reply_text(
+                "❌ حجم باید بین 1 تا 1000 گیگابایت باشد.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        context.user_data["awaiting_custom_gb_tier"] = None
+        order_id = create_direct_order(user_id, tier, gb)
+        plan = get_plan(direct_plan_key(tier, gb))
+
+        await update.message.reply_text(
+            f"""
+🧾 <b>سفارش #{order_id}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+📦 حجم:
+<b>{gb} GB</b>
+
+⏱ اعتبار:
+<b>30 روز</b>
+
+💰 مبلغ:
+<b>{format_price(plan["price"])} تومان</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 اگر موجودی کیف پولت کافی باشد، می‌توانی مستقیم از کیف پول پرداخت کنی.
+
+💳 یا می‌توانی با کارت پرداخت کنی و رسید بفرستی.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=order_payment_keyboard(order_id, include_wallet=True)
+        )
+        return
+
+    # =====================================================
     # CONFIG NAME INPUT
     # =====================================================
 
     if context.user_data.get("awaiting_config_name_order_id"):
         order_id = context.user_data.get("awaiting_config_name_order_id")
         config_name = text.strip()
-
-        panel_buttons = {
-            "👤 پروفایل و کیف پول", "🛒 فروشگاه اشتراک‌ها", "📡 سرویس های من",
-            "🎁 دعوت و دریافت رایگان", "📖 آموزش و راهنما", "🛟 تماس با پشتیبانی",
-            "💰 شارژ کیف پول"
-        }
-        if config_name in panel_buttons:
-            await user_reply(
-                update, context,
-                "⚠️ هنوز نام کانفیگت ثبت نشده است.\n\nلطفاً ابتدا یک نام دلخواه مثل <b>ali1370</b> ارسال کن.",
-                parse_mode=ParseMode.HTML
-            )
-            return
 
         if len(config_name) < 2:
             await user_reply(update, context, "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.\nمثال: <b>ali1370</b>", parse_mode=ParseMode.HTML)
@@ -3510,16 +3708,18 @@ async def text_handler(
     # =====================================================
 
     if text == "🛒 فروشگاه اشتراک‌ها":
-        await user_reply(update, context, 
+        context.user_data["awaiting_config_name_order_id"] = None
+        context.user_data["awaiting_custom_gb_tier"] = None
+        await user_reply(
+            update, context,
             """
 🛒 <b>فروشگاه اشتراک‌ها</b>
-
 ━━━━━━━━━━━━━━━━━━
 
-پلن موردنظر خودت را انتخاب کن:
+🔹 نوع سرویس را انتخاب کن:
 """,
             parse_mode=ParseMode.HTML,
-            reply_markup=plans_menu("plan")
+            reply_markup=service_type_menu()
         )
         return
 
