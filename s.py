@@ -37,8 +37,8 @@ SUPPORT_USERNAME = "@kaletek_Support"
 DB_PATH = "bot.db"
 
 # شماره کارت و نام صاحب کارت را اینجا وارد کن
-CARD_NUMBER = "PASTE_CARD_NUMBER_HERE"
-CARD_HOLDER = "PASTE_CARD_HOLDER_NAME_HERE"
+CARD_NUMBER = "5892 1014 0005 4561"
+CARD_HOLDER = "ابوالفضل اختری فر"
 
 # اگر برای پشتیبانی استیکر داری، file_id آن را اینجا بگذار
 SUPPORT_STICKER_ID = "PASTE_STICKER_FILE_ID_HERE"
@@ -823,11 +823,7 @@ def pay_order_with_wallet(order_id, user_id):
 # =========================================================
 
 def format_price(number):
-    return (
-        f"{int(number):,}"
-        .replace(",", "٬")
-        + " تومان"
-    )
+    return f"{int(number):,} تومان"
 
 
 def jalali_date(iso_date):
@@ -1046,7 +1042,7 @@ def profile_text(user_id):
     if not user:
         return "❌ اطلاعات حساب پیدا نشد."
 
-    active_services = sum(1 for service in services if service["active"])
+    active_services = [service for service in services if service["active"]]
     total_gb = sum(float(service["total_gb"] or 0) for service in services)
 
     invited_count = 0
@@ -1061,11 +1057,35 @@ def profile_text(user_id):
 
     balance = int(user["wallet_balance"] or 0)
     account_level = "همکار تجاری"
-    subscription_status = (
-        "فعال و آماده استفاده"
-        if active_services > 0
-        else "بدون اشتراک فعال"
-    )
+
+    if active_services:
+        subscription_status = "فعال و آماده استفاده"
+        subscription_lines = []
+        now = datetime.now()
+
+        for service in active_services:
+            plan = PLANS.get(
+                service["plan_key"],
+                {"name": service["plan_key"]}
+            )
+            try:
+                purchased_at = datetime.fromisoformat(service["purchased_at"])
+                elapsed_days = max(0, (now - purchased_at).days)
+            except Exception:
+                elapsed_days = 0
+
+            subscription_lines.extend([
+                f"📦 <b>نوع اشتراک:</b> {escape(str(plan['name']))}",
+                f"📊 <b>حجم کانفیگ:</b> {service['total_gb']} GB",
+                f"⏱ <b>مدت از زمان خرید:</b> {elapsed_days} روز",
+                f"🛒 <b>تاریخ خرید:</b> {jalali_date(service['purchased_at'])}",
+                f"📅 <b>تاریخ انقضا:</b> {jalali_date(service['expires_at'])}",
+                "┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄",
+            ])
+        subscription_details = "\n" + "\n".join(subscription_lines).rstrip("┄")
+    else:
+        subscription_status = "بدون اشتراک فعال"
+        subscription_details = "\n📭 هنوز اشتراک فعالی برای حساب شما ثبت نشده است."
 
     return f"""
 💳 <b>پروفایل کاربری شما</b>
@@ -1077,9 +1097,9 @@ def profile_text(user_id):
 💰 موجودی کیف پول: {format_price(balance)}
 👥 تعداد دعوت‌شدگان: {invited_count} نفر
 ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
-⚡️ وضعیت اشتراک: <b>{subscription_status}</b>
+⚡️ <b>وضعیت اشتراک: {subscription_status}</b>
+{subscription_details}
 """
-
 
 # =========================================================
 # PAYMENT TEXT / KEYBOARDS
@@ -1094,7 +1114,7 @@ def card_payment_text(title, amount, extra=""):
 ━━━━━━━━━━━━━━━━━━
 
 💰 <b>مبلغ پرداخت</b>
-{format_price(amount)} تومان
+{format_price(amount)}
 {extra_block}
 💳 <b>اطلاعات پرداخت</b>
 
@@ -1373,8 +1393,8 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
-💰 مبلغ سفارش: <b>{format_price(order['amount'])} تومان</b>
-💳 موجودی فعلی: <b>{format_price(current_balance)} تومان</b>
+💰 مبلغ سفارش: <b>{format_price(order['amount'])}</b>
+💳 موجودی فعلی: <b>{format_price(current_balance)}</b>
 
 🔸 برای پرداخت این سفارش، ابتدا کیف پولت را به اندازه کافی شارژ کن.
 
@@ -1549,12 +1569,12 @@ async def callbacks(
 💰 مبلغ موردنظر برای شارژ کیف پول را به تومان وارد کن.
 
 مثال:
-<code>500000</code>
+<code>50,000 تومان</code>
 
 ━━━━━━━━━━━━━━━━━━
 
-🔹 فقط عدد مبلغ را ارسال کن.
-🔹 حداقل مبلغ شارژ: <b>۱٬۰۰۰ تومان</b>
+🔹 مبلغ را با عدد وارد کن.
+🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -1596,7 +1616,7 @@ async def callbacks(
 ━━━━━━━━━━━━━━━━━━
 
 💰 <b>مبلغ شارژ</b>
-{format_price(amount)} تومان
+{format_price(amount)}
 
 📸 لطفاً تصویر واضح رسید پرداخت را همینجا ارسال کن.
 
@@ -2469,10 +2489,10 @@ async def callbacks(
 ━━━━━━━━━━━━━━━━━━
 
 💰 <b>مبلغ اضافه‌شده</b>
-{format_price(deposit['amount'])} تومان
+{format_price(deposit['amount'])}
 
 💳 <b>موجودی جدید کیف پول</b>
-{format_price(new_balance)} تومان
+{format_price(new_balance)}
 
 🎉 مبلغ با موفقیت به کیف پولت اضافه شد و اکنون قابل استفاده است.
 """,
@@ -2991,7 +3011,7 @@ async def text_handler(
         normalized = (
             text
             .replace(",", "")
-            .replace("٬", "")
+            .replace("تومان", "")
             .replace(" ", "")
         )
 
@@ -3003,7 +3023,7 @@ async def text_handler(
 لطفاً فقط عدد وارد کن.
 
 مثال:
-<code>500000</code>
+<code>50,000 تومان</code>
 """,
                 parse_mode=ParseMode.HTML
             )
@@ -3013,7 +3033,7 @@ async def text_handler(
 
         if amount < 1000:
             await update.message.reply_text(
-                "❌ حداقل مبلغ شارژ ۱٬۰۰۰ تومان است."
+                "❌ حداقل مبلغ شارژ 1,000 تومان است."
             )
             return
 
@@ -3107,20 +3127,20 @@ async def text_handler(
 
         await update.message.reply_text(
             """
-💰 <b>شارژ کیف پول</b>
+<b>✦ Kaletek</b>
 
+💳 <b>شارژ کیف پول</b>
 ━━━━━━━━━━━━━━━━━━
 
-مبلغ دلخواهت را به تومان وارد کن.
+💰 مبلغ موردنظر برای شارژ کیف پول را به تومان وارد کن.
 
 مثال:
-
-<code>500000</code>
+<code>50,000 تومان</code>
 
 ━━━━━━━━━━━━━━━━━━
 
-بعد از وارد کردن مبلغ، شماره کارت نمایش داده می‌شود
-و می‌توانی رسید پرداخت را ارسال کنی.
+🔹 مبلغ را با عدد وارد کن.
+🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
