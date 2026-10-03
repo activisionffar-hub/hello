@@ -22,10 +22,10 @@ from telegram.ext import (
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g", "").strip()
-ADMIN_ID = int(os.getenv("8815017184", "0") or 0)
-SUPPORT_USERNAME = os.getenv("8815017184", "@kaletek_Support")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
+BOT_TOKEN = "8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g"
+ADMIN_ID = 8815017184
+SUPPORT_USERNAME = "@kaletek_Support"
+DB_PATH = "bot.db"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
