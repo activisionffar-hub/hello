@@ -1,6 +1,8 @@
+
 import sqlite3
 import secrets
 from datetime import datetime, timedelta
+from html import escape
 
 import jdatetime
 
@@ -28,11 +30,18 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = "8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g"
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 
 ADMIN_ID = 8815017184
 SUPPORT_USERNAME = "@kaletek_Support"
 DB_PATH = "bot.db"
+
+# شماره کارت و نام صاحب کارت را اینجا وارد کن
+CARD_NUMBER = "PASTE_CARD_NUMBER_HERE"
+CARD_HOLDER = "PASTE_CARD_HOLDER_NAME_HERE"
+
+# اگر برای پشتیبانی استیکر داری، file_id آن را اینجا بگذار
+SUPPORT_STICKER_ID = "PASTE_STICKER_FILE_ID_HERE"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN تنظیم نشده است.")
@@ -52,14 +61,12 @@ PLANS = {
         "days": 30,
         "price": 89000,
     },
-
     "p100": {
         "name": "100 گیگ",
         "gb": 100,
         "days": 30,
         "price": 149000,
     },
-
     "p200": {
         "name": "200 گیگ",
         "gb": 200,
@@ -79,8 +86,21 @@ def db():
     return con
 
 
-def init_db():
+def ensure_column(con, table, column, definition):
+    columns = [
+        row["name"]
+        for row in con.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    ]
 
+    if column not in columns:
+        con.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+
+
+def init_db():
     con = db()
     cur = con.cursor()
 
@@ -94,6 +114,14 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    # سازگاری با دیتابیس قبلی
+    ensure_column(
+        con,
+        "users",
+        "wallet_balance",
+        "INTEGER DEFAULT 0"
+    )
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS services (
@@ -121,12 +149,53 @@ def init_db():
         )
     """)
 
+    # رسیدهای مربوط به خرید/سفارش
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payment_receipts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            file_id TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            admin_id INTEGER,
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT
+        )
+    """)
+
+    # درخواست‌های شارژ کیف پول
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_deposits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            receipt_file_id TEXT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            admin_id INTEGER,
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT
+        )
+    """)
+
+    # لاگ تراکنش‌های کیف پول
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            reference_id INTEGER,
+            description TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
+
     con.commit()
     con.close()
 
 
 def ensure_user(tg_user, referred_by=None):
-
     con = db()
     cur = con.cursor()
 
@@ -136,14 +205,12 @@ def ensure_user(tg_user, referred_by=None):
     ).fetchone()
 
     if not row:
-
         ref_code = secrets.token_hex(4).upper()
 
         while cur.execute(
             "SELECT 1 FROM users WHERE ref_code=?",
             (ref_code,)
         ).fetchone():
-
             ref_code = secrets.token_hex(4).upper()
 
         cur.execute("""
@@ -154,9 +221,10 @@ def ensure_user(tg_user, referred_by=None):
                 first_name,
                 ref_code,
                 referred_by,
-                created_at
+                created_at,
+                wallet_balance
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 0)
         """, (
             tg_user.id,
             tg_user.username or "",
@@ -165,9 +233,7 @@ def ensure_user(tg_user, referred_by=None):
             referred_by,
             datetime.now().isoformat(timespec="seconds"),
         ))
-
     else:
-
         cur.execute("""
             UPDATE users
             SET username=?,
@@ -184,7 +250,6 @@ def ensure_user(tg_user, referred_by=None):
 
 
 def get_user(user_id):
-
     con = db()
 
     row = con.execute(
@@ -193,12 +258,10 @@ def get_user(user_id):
     ).fetchone()
 
     con.close()
-
     return row
 
 
 def get_services(user_id):
-
     con = db()
 
     rows = con.execute("""
@@ -209,12 +272,10 @@ def get_services(user_id):
     """, (user_id,)).fetchall()
 
     con.close()
-
     return rows
 
 
 def create_order(user_id, plan_key):
-
     plan = PLANS[plan_key]
 
     con = db()
@@ -245,18 +306,11 @@ def create_order(user_id, plan_key):
 
 
 def create_service(user_id, plan_key, config):
-
     plan = PLANS[plan_key]
-
     now = datetime.now()
+    expires = now + timedelta(days=plan["days"])
 
-    expires = now + timedelta(
-        days=plan["days"]
-    )
-
-    code = str(
-        secrets.randbelow(9000) + 1000
-    )
+    code = str(secrets.randbelow(9000) + 1000)
 
     con = db()
 
@@ -264,10 +318,7 @@ def create_service(user_id, plan_key, config):
         "SELECT 1 FROM services WHERE code=?",
         (code,)
     ).fetchone():
-
-        code = str(
-            secrets.randbelow(9000) + 1000
-        )
+        code = str(secrets.randbelow(9000) + 1000)
 
     cur = con.cursor()
 
@@ -302,35 +353,410 @@ def create_service(user_id, plan_key, config):
 
 
 # =========================================================
+# PAYMENT / WALLET DATABASE FUNCTIONS
+# =========================================================
+
+def has_pending_order_receipt(order_id):
+    con = db()
+
+    row = con.execute("""
+        SELECT id
+        FROM payment_receipts
+        WHERE order_id=?
+          AND status='pending'
+        LIMIT 1
+    """, (order_id,)).fetchone()
+
+    con.close()
+    return row is not None
+
+
+def create_payment_receipt(order_id, user_id, amount, file_id):
+    con = db()
+
+    cur = con.cursor()
+
+    cur.execute("""
+        INSERT INTO payment_receipts
+        (
+            order_id,
+            user_id,
+            amount,
+            file_id,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, 'pending', ?)
+    """, (
+        order_id,
+        user_id,
+        amount,
+        file_id,
+        datetime.now().isoformat(timespec="seconds"),
+    ))
+
+    receipt_id = cur.lastrowid
+
+    cur.execute("""
+        UPDATE orders
+        SET status='receipt_pending'
+        WHERE id=?
+          AND status IN ('pending', 'rejected')
+    """, (order_id,))
+
+    con.commit()
+    con.close()
+
+    return receipt_id
+
+
+def approve_payment_receipt(receipt_id, admin_id):
+    """
+    تأیید رسید خرید:
+    مبلغ رسید دقیقاً به کیف پول کاربر اضافه می‌شود.
+    با UPDATE شرطی status='pending' از دوباره شارژ شدن جلوگیری می‌شود.
+    """
+    con = db()
+
+    try:
+        con.execute("BEGIN")
+
+        receipt = con.execute("""
+            SELECT *
+            FROM payment_receipts
+            WHERE id=?
+        """, (receipt_id,)).fetchone()
+
+        if not receipt:
+            con.rollback()
+            return None, None, "not_found"
+
+        cur = con.execute("""
+            UPDATE payment_receipts
+            SET status='approved',
+                admin_id=?,
+                reviewed_at=?
+            WHERE id=?
+              AND status='pending'
+        """, (
+            admin_id,
+            datetime.now().isoformat(timespec="seconds"),
+            receipt_id,
+        ))
+
+        if cur.rowcount != 1:
+            con.rollback()
+            return None, None, "already_processed"
+
+        con.execute("""
+            UPDATE users
+            SET wallet_balance=COALESCE(wallet_balance, 0) + ?
+            WHERE user_id=?
+        """, (
+            receipt["amount"],
+            receipt["user_id"],
+        ))
+
+        con.execute("""
+            UPDATE orders
+            SET status='paid'
+            WHERE id=?
+        """, (receipt["order_id"],))
+
+        con.execute("""
+            INSERT INTO wallet_transactions
+            (
+                user_id,
+                amount,
+                type,
+                reference_id,
+                description,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            receipt["user_id"],
+            receipt["amount"],
+            "deposit_order",
+            receipt["order_id"],
+            f"شارژ کیف پول بابت سفارش #{receipt['order_id']}",
+            datetime.now().isoformat(timespec="seconds"),
+        ))
+
+        balance_row = con.execute("""
+            SELECT wallet_balance
+            FROM users
+            WHERE user_id=?
+        """, (receipt["user_id"],)).fetchone()
+
+        new_balance = (
+            balance_row["wallet_balance"]
+            if balance_row
+            else receipt["amount"]
+        )
+
+        con.commit()
+
+        return receipt, new_balance, "approved"
+
+    except Exception:
+        con.rollback()
+        raise
+
+    finally:
+        con.close()
+
+
+def reject_payment_receipt(receipt_id, admin_id):
+    con = db()
+
+    try:
+        con.execute("BEGIN")
+
+        receipt = con.execute("""
+            SELECT *
+            FROM payment_receipts
+            WHERE id=?
+        """, (receipt_id,)).fetchone()
+
+        if not receipt:
+            con.rollback()
+            return None, "not_found"
+
+        cur = con.execute("""
+            UPDATE payment_receipts
+            SET status='rejected',
+                admin_id=?,
+                reviewed_at=?
+            WHERE id=?
+              AND status='pending'
+        """, (
+            admin_id,
+            datetime.now().isoformat(timespec="seconds"),
+            receipt_id,
+        ))
+
+        if cur.rowcount != 1:
+            con.rollback()
+            return None, "already_processed"
+
+        con.execute("""
+            UPDATE orders
+            SET status='rejected'
+            WHERE id=?
+        """, (receipt["order_id"],))
+
+        con.commit()
+
+        return receipt, "rejected"
+
+    except Exception:
+        con.rollback()
+        raise
+
+    finally:
+        con.close()
+
+
+def has_pending_wallet_deposit(user_id):
+    con = db()
+
+    row = con.execute("""
+        SELECT id
+        FROM wallet_deposits
+        WHERE user_id=?
+          AND status='pending'
+        LIMIT 1
+    """, (user_id,)).fetchone()
+
+    con.close()
+    return row is not None
+
+
+def create_wallet_deposit(user_id, amount, file_id):
+    con = db()
+    cur = con.cursor()
+
+    cur.execute("""
+        INSERT INTO wallet_deposits
+        (
+            user_id,
+            amount,
+            receipt_file_id,
+            status,
+            created_at
+        )
+        VALUES (?, ?, ?, 'pending', ?)
+    """, (
+        user_id,
+        amount,
+        file_id,
+        datetime.now().isoformat(timespec="seconds"),
+    ))
+
+    deposit_id = cur.lastrowid
+
+    con.commit()
+    con.close()
+
+    return deposit_id
+
+
+def approve_wallet_deposit(deposit_id, admin_id):
+    """
+    شارژ کیف پول با مبلغ دلخواه مشتری.
+    فقط یک بار می‌تواند موفق شود.
+    """
+    con = db()
+
+    try:
+        con.execute("BEGIN")
+
+        deposit = con.execute("""
+            SELECT *
+            FROM wallet_deposits
+            WHERE id=?
+        """, (deposit_id,)).fetchone()
+
+        if not deposit:
+            con.rollback()
+            return None, None, "not_found"
+
+        cur = con.execute("""
+            UPDATE wallet_deposits
+            SET status='approved',
+                admin_id=?,
+                reviewed_at=?
+            WHERE id=?
+              AND status='pending'
+        """, (
+            admin_id,
+            datetime.now().isoformat(timespec="seconds"),
+            deposit_id,
+        ))
+
+        if cur.rowcount != 1:
+            con.rollback()
+            return None, None, "already_processed"
+
+        con.execute("""
+            UPDATE users
+            SET wallet_balance=COALESCE(wallet_balance, 0) + ?
+            WHERE user_id=?
+        """, (
+            deposit["amount"],
+            deposit["user_id"],
+        ))
+
+        con.execute("""
+            INSERT INTO wallet_transactions
+            (
+                user_id,
+                amount,
+                type,
+                reference_id,
+                description,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            deposit["user_id"],
+            deposit["amount"],
+            "wallet_deposit",
+            deposit_id,
+            f"شارژ کیف پول #{deposit_id}",
+            datetime.now().isoformat(timespec="seconds"),
+        ))
+
+        balance_row = con.execute("""
+            SELECT wallet_balance
+            FROM users
+            WHERE user_id=?
+        """, (deposit["user_id"],)).fetchone()
+
+        new_balance = (
+            balance_row["wallet_balance"]
+            if balance_row
+            else deposit["amount"]
+        )
+
+        con.commit()
+
+        return deposit, new_balance, "approved"
+
+    except Exception:
+        con.rollback()
+        raise
+
+    finally:
+        con.close()
+
+
+def reject_wallet_deposit(deposit_id, admin_id):
+    con = db()
+
+    try:
+        con.execute("BEGIN")
+
+        deposit = con.execute("""
+            SELECT *
+            FROM wallet_deposits
+            WHERE id=?
+        """, (deposit_id,)).fetchone()
+
+        if not deposit:
+            con.rollback()
+            return None, "not_found"
+
+        cur = con.execute("""
+            UPDATE wallet_deposits
+            SET status='rejected',
+                admin_id=?,
+                reviewed_at=?
+            WHERE id=?
+              AND status='pending'
+        """, (
+            admin_id,
+            datetime.now().isoformat(timespec="seconds"),
+            deposit_id,
+        ))
+
+        if cur.rowcount != 1:
+            con.rollback()
+            return None, "already_processed"
+
+        con.commit()
+
+        return deposit, "rejected"
+
+    except Exception:
+        con.rollback()
+        raise
+
+    finally:
+        con.close()
+
+
+# =========================================================
 # HELPERS
 # =========================================================
 
 def format_price(number):
-
     return (
-        f"{number:,}"
+        f"{int(number):,}"
         .replace(",", "٬")
         + " تومان"
     )
 
 
 def jalali_date(iso_date):
+    dt = datetime.fromisoformat(iso_date)
+    j = jdatetime.datetime.fromgregorian(datetime=dt)
 
-    dt = datetime.fromisoformat(
-        iso_date
-    )
-
-    j = jdatetime.datetime.fromgregorian(
-        datetime=dt
-    )
-
-    return j.strftime(
-        "%Y/%m/%d %H:%M"
-    )
+    return j.strftime("%Y/%m/%d %H:%M")
 
 
 def back_button(target="home"):
-
     return InlineKeyboardButton(
         "🔙 بازگشت",
         callback_data=target
@@ -342,48 +768,40 @@ def back_button(target="home"):
 # =========================================================
 
 def user_panel():
-
     return ReplyKeyboardMarkup(
-
         [
-
             [
                 KeyboardButton(
                     "👤 پروفایل و کیف پول"
                 ),
-
                 KeyboardButton(
                     "🛒 فروشگاه اشتراک‌ها"
                 ),
             ],
-
             [
                 KeyboardButton(
                     "📡 سرویس های من"
                 ),
+                KeyboardButton(
+                    "💰 شارژ کیف پول"
+                ),
             ],
-
             [
                 KeyboardButton(
                     "🎁 دعوت و دریافت رایگان"
                 ),
             ],
-
             [
                 KeyboardButton(
                     "📖 آموزش و راهنما"
                 ),
-
                 KeyboardButton(
                     "🛟 تماس با پشتیبانی"
                 ),
             ],
-
         ],
-
         resize_keyboard=True,
         is_persistent=True,
-
         input_field_placeholder=(
             "یک گزینه را انتخاب کنید..."
         )
@@ -395,30 +813,22 @@ def user_panel():
 # =========================================================
 
 def plans_menu(prefix="plan"):
-
     buttons = []
 
     for key, plan in PLANS.items():
-
         buttons.append([
-
             InlineKeyboardButton(
-
                 f"⚡ {plan['name']} • "
                 f"{format_price(plan['price'])}",
-
                 callback_data=f"{prefix}:{key}"
             )
-
         ])
 
     buttons.append([
         back_button("home")
     ])
 
-    return InlineKeyboardMarkup(
-        buttons
-    )
+    return InlineKeyboardMarkup(buttons)
 
 
 # =========================================================
@@ -426,55 +836,45 @@ def plans_menu(prefix="plan"):
 # =========================================================
 
 def admin_menu():
-
     return InlineKeyboardMarkup([
-
         [
-
             InlineKeyboardButton(
                 "📊 آمار",
                 callback_data="admin_stats"
             ),
-
             InlineKeyboardButton(
                 "📋 سفارش‌ها",
                 callback_data="admin_orders"
             ),
-
         ],
-
         [
-
             InlineKeyboardButton(
                 "👥 کاربران",
                 callback_data="admin_users"
             ),
-
             InlineKeyboardButton(
                 "📦 سرویس‌ها",
                 callback_data="admin_services"
             ),
-
         ],
-
         [
-
+            InlineKeyboardButton(
+                "💰 شارژهای کیف پول",
+                callback_data="admin_wallet"
+            ),
+        ],
+        [
             InlineKeyboardButton(
                 "➕ تحویل سرویس",
                 callback_data="admin_deliver"
             ),
-
         ],
-
         [
-
             InlineKeyboardButton(
                 "🏠 پنل کاربری",
                 callback_data="home"
             ),
-
         ],
-
     ])
 
 
@@ -495,6 +895,7 @@ WELCOME = """
 🔐 سرویس اختصاصی
 📦 مدیریت سرویس‌ها
 💳 خرید آسان
+💰 کیف پول
 💬 پشتیبانی
 
 از منوی پایین انتخاب کن:
@@ -506,13 +907,9 @@ WELCOME = """
 # =========================================================
 
 def services_text(user_id):
-
-    services = get_services(
-        user_id
-    )
+    services = get_services(user_id)
 
     if not services:
-
         return """
 📡 <b>سرویس های من</b>
 
@@ -530,7 +927,6 @@ def services_text(user_id):
     ]
 
     for service in services:
-
         status = (
             "🟢 فعال"
             if service["active"]
@@ -539,32 +935,20 @@ def services_text(user_id):
 
         plan = PLANS.get(
             service["plan_key"],
-            {
-                "name":
-                service["plan_key"]
-            }
+            {"name": service["plan_key"]}
         )
 
         lines.extend([
-
             f"🛰 <b>{plan['name']}</b>",
-
             f"🔑 کد سرویس: "
-            f"<code>{service['code']}</code>",
-
+            f"<code>{escape(str(service['code']))}</code>",
             f"📊 وضعیت: {status}",
-
-            f"📦 حجم: "
-            f"{service['total_gb']} GB",
-
+            f"📦 حجم: {service['total_gb']} GB",
             f"📅 انقضا: "
             f"{jalali_date(service['expires_at'])}",
-
             f"🛒 خرید: "
             f"{jalali_date(service['purchased_at'])}",
-
             "━━━━━━━━━━━━━━━━━━",
-
         ])
 
     return "\n".join(lines)
@@ -575,20 +959,11 @@ def services_text(user_id):
 # =========================================================
 
 def profile_text(user_id):
-
-    user = get_user(
-        user_id
-    )
-
-    services = get_services(
-        user_id
-    )
+    user = get_user(user_id)
+    services = get_services(user_id)
 
     if not user:
-
-        return (
-            "❌ اطلاعات حساب پیدا نشد."
-        )
+        return "❌ اطلاعات حساب پیدا نشد."
 
     active_services = sum(
         1
@@ -597,13 +972,12 @@ def profile_text(user_id):
     )
 
     username = (
-
         f"@{user['username']}"
-
         if user["username"]
-
         else "ندارد"
     )
+
+    balance = user["wallet_balance"] or 0
 
     return f"""
 👤 <b>پروفایل و کیف پول</b>
@@ -614,10 +988,10 @@ def profile_text(user_id):
 <code>{user_id}</code>
 
 👤 نام:
-{user['first_name'] or '—'}
+{escape(user['first_name'] or '—')}
 
 🔗 یوزرنیم:
-{username}
+{escape(username)}
 
 📦 تعداد سرویس:
 <b>{len(services)}</b>
@@ -626,14 +1000,58 @@ def profile_text(user_id):
 <b>{active_services}</b>
 
 💰 موجودی کیف پول:
-<b>0 تومان</b>
+<b>{format_price(balance)}</b>
 
 🎁 کد دعوت:
-<code>{user['ref_code']}</code>
+<code>{escape(user['ref_code'])}</code>
 
 📅 عضویت:
 {jalali_date(user['created_at'])}
 """
+
+
+# =========================================================
+# PAYMENT TEXT / KEYBOARDS
+# =========================================================
+
+def card_payment_text(title, amount, extra=""):
+    return f"""
+💳 <b>{title}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ:
+<b>{format_price(amount)}</b>
+
+{extra}
+
+💳 <b>اطلاعات پرداخت</b>
+
+شماره کارت:
+<code>{escape(CARD_NUMBER)}</code>
+
+به نام:
+<b>{escape(CARD_HOLDER)}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+بعد از واریز، تصویر رسید را از طریق
+دکمه «📤 ارسال رسید» ارسال کن.
+"""
+
+
+def order_payment_keyboard(order_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "📤 ارسال رسید",
+                callback_data=f"receipt:{order_id}"
+            )
+        ],
+        [
+            back_button("buy")
+        ],
+    ])
 
 
 # =========================================================
@@ -644,18 +1062,13 @@ async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     user = update.effective_user
 
     referred_by = None
 
     if context.args:
-
         try:
-
-            candidate = int(
-                context.args[0]
-            )
+            candidate = int(context.args[0])
 
             if candidate != user.id:
                 referred_by = candidate
@@ -663,17 +1076,30 @@ async def start(
         except ValueError:
             pass
 
-    ensure_user(
-        user,
-        referred_by
-    )
+    ensure_user(user, referred_by)
+
+    # ادمین پنل مشتری نبیند
+    if user.id == ADMIN_ID:
+        context.user_data["awaiting_delivery"] = False
+
+        await update.message.reply_text(
+            """
+👑 <b>پنل مدیریت</b>
+
+━━━━━━━━━━━━━━━━━━
+
+به پنل مدیریت فروشگاه خوش آمدید.
+
+یک گزینه را انتخاب کنید:
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu()
+        )
+        return
 
     await update.message.reply_text(
-
         WELCOME,
-
         parse_mode=ParseMode.HTML,
-
         reply_markup=user_panel()
     )
 
@@ -686,21 +1112,18 @@ async def admin(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     if update.effective_user.id != ADMIN_ID:
-
         await update.message.reply_text(
             "⛔ دسترسی ندارید."
         )
-
         return
 
-    context.user_data[
-        "awaiting_delivery"
-    ] = False
+    context.user_data["awaiting_delivery"] = False
+    context.user_data["awaiting_receipt_order_id"] = None
+    context.user_data["awaiting_wallet_amount"] = False
+    context.user_data["awaiting_wallet_receipt"] = False
 
     await update.message.reply_text(
-
         """
 👑 <b>پنل مدیریت</b>
 
@@ -710,9 +1133,7 @@ async def admin(
 
 یک گزینه را انتخاب کنید:
 """,
-
         parse_mode=ParseMode.HTML,
-
         reply_markup=admin_menu()
     )
 
@@ -725,16 +1146,11 @@ async def callbacks(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     q = update.callback_query
-
     await q.answer()
 
     user_id = q.from_user.id
-
-    ensure_user(
-        q.from_user
-    )
+    ensure_user(q.from_user)
 
     data = q.data
 
@@ -743,10 +1159,25 @@ async def callbacks(
     # =====================================================
 
     if data == "home":
+        context.user_data["awaiting_delivery"] = False
+        context.user_data["awaiting_receipt_order_id"] = None
+        context.user_data["awaiting_wallet_amount"] = False
+        context.user_data["awaiting_wallet_receipt"] = False
 
-        context.user_data[
-            "awaiting_delivery"
-        ] = False
+        # ادمین هیچ وقت پنل مشتری نبیند
+        if user_id == ADMIN_ID:
+            await q.edit_message_text(
+                """
+👑 <b>پنل مدیریت</b>
+
+━━━━━━━━━━━━━━━━━━
+
+یک گزینه را انتخاب کنید:
+""",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_menu()
+            )
+            return
 
         await q.edit_message_text(
             WELCOME,
@@ -757,7 +1188,6 @@ async def callbacks(
             "🖥 پنل کاربری آماده است:",
             reply_markup=user_panel()
         )
-
         return
 
     # =====================================================
@@ -765,9 +1195,7 @@ async def callbacks(
     # =====================================================
 
     if data == "buy":
-
         await q.edit_message_text(
-
             """
 🛒 <b>فروشگاه اشتراک‌ها</b>
 
@@ -779,14 +1207,9 @@ async def callbacks(
 🔐 سرویس اختصاصی
 📅 اعتبار ۳۰ روزه
 """,
-
             parse_mode=ParseMode.HTML,
-
-            reply_markup=plans_menu(
-                "plan"
-            )
+            reply_markup=plans_menu("plan")
         )
-
         return
 
     # =====================================================
@@ -794,15 +1217,8 @@ async def callbacks(
     # =====================================================
 
     if data.startswith("plan:"):
-
-        plan_key = data.split(
-            ":",
-            1
-        )[1]
-
-        plan = PLANS.get(
-            plan_key
-        )
+        plan_key = data.split(":", 1)[1]
+        plan = PLANS.get(plan_key)
 
         if not plan:
             return
@@ -827,82 +1243,198 @@ async def callbacks(
 <b>{plan['days']} روز</b>
 
 💰 مبلغ:
-
 <b>{format_price(plan['price'])}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-برای ادامه روی «💳 پرداخت» بزن.
+بعد از واریز مبلغ، روی
+«📤 ارسال رسید» بزن.
 """
 
         keyboard = InlineKeyboardMarkup([
-
             [
                 InlineKeyboardButton(
-                    "💳 پرداخت",
-                    callback_data=f"pay:{order_id}"
+                    "📤 ارسال رسید",
+                    callback_data=f"receipt:{order_id}"
                 )
             ],
-
             [
                 back_button("buy")
             ],
-
         ])
 
         await q.edit_message_text(
-
             text,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=keyboard
         )
-
         return
 
     # =====================================================
-    # PAYMENT
+    # OLD PAYMENT CALLBACK - KEEPING COMPATIBILITY
     # =====================================================
 
     if data.startswith("pay:"):
+        order_id = data.split(":", 1)[1]
 
-        order_id = data.split(
-            ":",
-            1
-        )[1]
+        con = db()
+        order = con.execute(
+            "SELECT * FROM orders WHERE id=?",
+            (order_id,)
+        ).fetchone()
+        con.close()
+
+        if not order or order["user_id"] != user_id:
+            await q.answer(
+                "❌ سفارش پیدا نشد.",
+                show_alert=True
+            )
+            return
 
         await q.edit_message_text(
+            card_payment_text(
+                f"پرداخت سفارش #{order_id}",
+                order["amount"]
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=order_payment_keyboard(order_id)
+        )
+        return
 
+    # =====================================================
+    # ORDER RECEIPT
+    # =====================================================
+
+    if data.startswith("receipt:"):
+        order_id = data.split(":", 1)[1]
+
+        try:
+            order_id_int = int(order_id)
+        except ValueError:
+            return
+
+        con = db()
+        order = con.execute(
+            "SELECT * FROM orders WHERE id=?",
+            (order_id_int,)
+        ).fetchone()
+        con.close()
+
+        if not order or order["user_id"] != user_id:
+            await q.answer(
+                "❌ سفارش پیدا نشد.",
+                show_alert=True
+            )
+            return
+
+        if order["status"] == "paid":
+            await q.answer(
+                "✅ این سفارش قبلاً تأیید شده است.",
+                show_alert=True
+            )
+            return
+
+        if has_pending_order_receipt(order_id_int):
+            await q.answer(
+                "⏳ رسید این سفارش قبلاً ارسال شده و در انتظار بررسی است.",
+                show_alert=True
+            )
+            return
+
+        context.user_data["awaiting_delivery"] = False
+        context.user_data["awaiting_wallet_amount"] = False
+        context.user_data["awaiting_wallet_receipt"] = False
+        context.user_data["awaiting_receipt_order_id"] = order_id_int
+
+        await q.message.reply_text(
             f"""
-💳 <b>پرداخت سفارش #{order_id}</b>
+📤 <b>ارسال رسید سفارش #{order_id_int}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-این قسمت آماده اتصال به درگاه پرداخت است.
+💰 مبلغ سفارش:
+<b>{format_price(order['amount'])}</b>
 
-پس از اتصال درگاه:
+لطفاً <b>عکس رسید پرداخت</b> را همینجا ارسال کن.
 
-1️⃣ پرداخت کاربر
-2️⃣ تأیید تراکنش
-3️⃣ تأیید سفارش
-4️⃣ ساخت سرویس
-5️⃣ ارسال کانفیگ
-
-⚠️ در نسخه فعلی پرداخت واقعی فعال نیست.
+بعد از ارسال، رسید برای ادمین فرستاده می‌شود و پس از تأیید،
+مبلغ پرداختی به کیف پولت اضافه خواهد شد.
 """,
+            parse_mode=ParseMode.HTML
+        )
+        return
 
+    # =====================================================
+    # WALLET TOP-UP CALLBACK
+    # =====================================================
+
+    if data == "wallet_topup":
+        context.user_data["awaiting_delivery"] = False
+        context.user_data["awaiting_receipt_order_id"] = None
+        context.user_data["awaiting_wallet_receipt"] = False
+        context.user_data["awaiting_wallet_amount"] = True
+
+        await q.edit_message_text(
+            """
+💰 <b>شارژ کیف پول</b>
+
+━━━━━━━━━━━━━━━━━━
+
+مبلغی که می‌خواهی به کیف پولت اضافه شود را به تومان وارد کن.
+
+مثال:
+
+<code>500000</code>
+
+━━━━━━━━━━━━━━━━━━
+
+⚠️ فقط عدد مبلغ را ارسال کن.
+""",
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
-                [
-                    back_button("buy")
-                ]
-
+                [back_button("profile")]
             ])
         )
+        return
 
+    # =====================================================
+    # WALLET SEND RECEIPT
+    # =====================================================
+
+    if data == "wallet_send_receipt":
+        amount = context.user_data.get("wallet_amount")
+
+        if not amount:
+            await q.answer(
+                "❌ مبلغ شارژ پیدا نشد. دوباره اقدام کن.",
+                show_alert=True
+            )
+            return
+
+        if has_pending_wallet_deposit(user_id):
+            context.user_data["wallet_amount"] = None
+
+            await q.answer(
+                "⏳ یک درخواست شارژ قبلی هنوز در انتظار بررسی است.",
+                show_alert=True
+            )
+            return
+
+        context.user_data["awaiting_receipt_order_id"] = None
+
+        await q.message.reply_text(
+            f"""
+📤 <b>ارسال رسید شارژ کیف پول</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ:
+<b>{format_price(amount)}</b>
+
+لطفاً عکس رسید پرداخت را همینجا ارسال کن.
+""",
+            parse_mode=ParseMode.HTML
+        )
         return
 
     # =====================================================
@@ -910,29 +1442,21 @@ async def callbacks(
     # =====================================================
 
     if data == "services":
-
         await q.edit_message_text(
-
             services_text(user_id),
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
                 [
                     InlineKeyboardButton(
                         "🔄 تمدید سرویس",
                         callback_data="renew"
                     )
                 ],
-
                 [
                     back_button("home")
                 ]
-
             ])
         )
-
         return
 
     # =====================================================
@@ -940,15 +1464,10 @@ async def callbacks(
     # =====================================================
 
     if data == "renew":
-
-        services = get_services(
-            user_id
-        )
+        services = get_services(user_id)
 
         if not services:
-
             await q.edit_message_text(
-
                 """
 🔄 <b>تمدید سرویس</b>
 
@@ -958,29 +1477,22 @@ async def callbacks(
 
 ابتدا یک سرویس خریداری کنید.
 """,
-
                 parse_mode=ParseMode.HTML,
-
                 reply_markup=InlineKeyboardMarkup([
-
                     [
                         InlineKeyboardButton(
                             "🛒 خرید سرویس",
                             callback_data="buy"
                         )
                     ],
-
                     [
                         back_button("home")
                     ]
-
                 ])
             )
-
             return
 
         await q.edit_message_text(
-
             """
 🔄 <b>تمدید سرویس</b>
 
@@ -988,32 +1500,18 @@ async def callbacks(
 
 پلن موردنظر برای تمدید را انتخاب کن:
 """,
-
             parse_mode=ParseMode.HTML,
-
-            reply_markup=plans_menu(
-                "renewplan"
-            )
+            reply_markup=plans_menu("renewplan")
         )
-
         return
 
     # =====================================================
     # RENEW PLAN
     # =====================================================
 
-    if data.startswith(
-        "renewplan:"
-    ):
-
-        plan_key = data.split(
-            ":",
-            1
-        )[1]
-
-        plan = PLANS.get(
-            plan_key
-        )
+    if data.startswith("renewplan:"):
+        plan_key = data.split(":", 1)[1]
+        plan = PLANS.get(plan_key)
 
         if not plan:
             return
@@ -1024,7 +1522,6 @@ async def callbacks(
         )
 
         await q.edit_message_text(
-
             f"""
 🔄 <b>تمدید سرویس</b>
 
@@ -1045,25 +1542,19 @@ async def callbacks(
 🧾 سفارش:
 <code>#{order_id}</code>
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
                 [
                     InlineKeyboardButton(
-                        "💳 پرداخت",
-                        callback_data=f"pay:{order_id}"
+                        "📤 ارسال رسید",
+                        callback_data=f"receipt:{order_id}"
                     )
                 ],
-
                 [
                     back_button("renew")
                 ]
-
             ])
         )
-
         return
 
     # =====================================================
@@ -1071,36 +1562,33 @@ async def callbacks(
     # =====================================================
 
     if data == "profile":
-
         await q.edit_message_text(
-
             profile_text(user_id),
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
+                [
+                    InlineKeyboardButton(
+                        "💰 شارژ کیف پول",
+                        callback_data="wallet_topup"
+                    )
+                ],
                 [
                     InlineKeyboardButton(
                         "📡 سرویس های من",
                         callback_data="services"
                     )
                 ],
-
                 [
                     InlineKeyboardButton(
                         "🎁 دعوت و دریافت رایگان",
                         callback_data="ref"
                     )
                 ],
-
                 [
                     back_button("home")
                 ]
-
             ])
         )
-
         return
 
     # =====================================================
@@ -1108,10 +1596,7 @@ async def callbacks(
     # =====================================================
 
     if data == "ref":
-
-        bot_username = (
-            context.bot.username
-        )
+        bot_username = context.bot.username
 
         link = (
             f"https://t.me/"
@@ -1120,7 +1605,6 @@ async def callbacks(
         )
 
         await q.edit_message_text(
-
             f"""
 🎁 <b>دعوت و دریافت رایگان</b>
 
@@ -1128,7 +1612,7 @@ async def callbacks(
 
 لینک اختصاصی شما:
 
-<code>{link}</code>
+<code>{escape(link)}</code>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1140,18 +1624,11 @@ async def callbacks(
 🎁 سیستم پاداش و اعتبار دعوت
 در مرحله بعد قابل فعال‌سازی است.
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
-                [
-                    back_button("home")
-                ]
-
+                [back_button("home")]
             ])
         )
-
         return
 
     # =====================================================
@@ -1159,9 +1636,7 @@ async def callbacks(
     # =====================================================
 
     if data == "guide":
-
         await q.edit_message_text(
-
             """
 📖 <b>آموزش و راهنما</b>
 
@@ -1180,25 +1655,19 @@ async def callbacks(
 اگر مشکلی داشتی، از بخش
 «🛟 تماس با پشتیبانی» استفاده کن.
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
                 [
                     InlineKeyboardButton(
                         "🛟 تماس با پشتیبانی",
                         callback_data="support"
                     )
                 ],
-
                 [
                     back_button("home")
                 ]
-
             ])
         )
-
         return
 
     # =====================================================
@@ -1206,37 +1675,44 @@ async def callbacks(
     # =====================================================
 
     if data == "support":
+        if (
+            SUPPORT_STICKER_ID
+            and SUPPORT_STICKER_ID != "PASTE_STICKER_FILE_ID_HERE"
+        ):
+            try:
+                await q.message.reply_sticker(
+                    SUPPORT_STICKER_ID
+                )
+            except Exception:
+                pass
 
         await q.edit_message_text(
-
-            f"""
+            """
 🛟 <b>تماس با پشتیبانی</b>
 
 ━━━━━━━━━━━━━━━━━━
 
 اگر در خرید یا سرویس مشکلی داری،
-با پشتیبانی در ارتباط باش:
-
-👤 {SUPPORT_USERNAME}
+از دکمه زیر با پشتیبانی تماس بگیر.
 
 ━━━━━━━━━━━━━━━━━━
-
-هنگام ارسال پیام، اگر مربوط به
-سرویس یا سفارش خاصی است، کد سرویس
-یا شماره سفارش را هم ارسال کن.
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
+                [
+                    InlineKeyboardButton(
+                        "💬 تماس با پشتیبانی",
+                        url=(
+                            "https://t.me/"
+                            + SUPPORT_USERNAME.lstrip("@")
+                        )
+                    )
+                ],
                 [
                     back_button("home")
                 ]
-
             ])
         )
-
         return
 
     # =====================================================
@@ -1251,13 +1727,9 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_home":
-
-        context.user_data[
-            "awaiting_delivery"
-        ] = False
+        context.user_data["awaiting_delivery"] = False
 
         await q.edit_message_text(
-
             """
 👑 <b>پنل مدیریت</b>
 
@@ -1265,12 +1737,9 @@ async def callbacks(
 
 یک گزینه را انتخاب کنید:
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=admin_menu()
         )
-
         return
 
     # =====================================================
@@ -1278,7 +1747,6 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_stats":
-
         con = db()
 
         users = con.execute(
@@ -1305,22 +1773,32 @@ async def callbacks(
             """
             SELECT COUNT(*) c
             FROM orders
-            WHERE status='pending'
+            WHERE status IN ('pending', 'receipt_pending')
             """
         ).fetchone()["c"]
 
         paid = con.execute(
+            "SELECT COUNT(*) c FROM orders WHERE status='paid'"
+        ).fetchone()["c"]
+
+        pending_wallet = con.execute(
             """
             SELECT COUNT(*) c
-            FROM orders
-            WHERE status='paid'
+            FROM wallet_deposits
+            WHERE status='pending'
             """
         ).fetchone()["c"]
+
+        total_wallet = con.execute(
+            """
+            SELECT COALESCE(SUM(wallet_balance), 0) total
+            FROM users
+            """
+        ).fetchone()["total"]
 
         con.close()
 
         await q.edit_message_text(
-
             f"""
 📊 <b>آمار فروشگاه</b>
 
@@ -1341,15 +1819,18 @@ async def callbacks(
 💳 پرداخت‌شده:
 <b>{paid}</b>
 
-⏳ در انتظار پرداخت:
+⏳ در انتظار رسید سفارش:
 <b>{pending}</b>
+
+💰 درخواست شارژ کیف پول:
+<b>{pending_wallet}</b>
+
+💵 مجموع موجودی کیف پول کاربران:
+<b>{format_price(total_wallet)}</b>
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=admin_menu()
         )
-
         return
 
     # =====================================================
@@ -1357,7 +1838,6 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_orders":
-
         con = db()
 
         rows = con.execute("""
@@ -1376,50 +1856,35 @@ async def callbacks(
         con.close()
 
         if not rows:
-
-            text = (
-                "📋 هنوز سفارشی ثبت نشده."
-            )
-
+            text = "📋 هنوز سفارشی ثبت نشده."
         else:
-
             lines = [
                 "📋 <b>آخرین سفارش‌ها</b>",
                 "━━━━━━━━━━━━━━━━━━"
             ]
 
             for row in rows:
-
                 plan = PLANS.get(
                     row["plan_key"],
-                    {
-                        "name":
-                        row["plan_key"]
-                    }
+                    {"name": row["plan_key"]}
                 )
 
                 lines.append(
-
                     f"🧾 <b>#{row['id']}</b>\n"
                     f"👤 <code>{row['user_id']}</code>\n"
                     f"⚡ {plan['name']}\n"
                     f"💰 {format_price(row['amount'])}\n"
-                    f"📌 وضعیت: {row['status']}\n"
+                    f"📌 وضعیت: {escape(row['status'])}\n"
                     f"━━━━━━━━━━━━━━━━━━"
-
                 )
 
             text = "\n".join(lines)
 
         await q.edit_message_text(
-
             text,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=admin_menu()
         )
-
         return
 
     # =====================================================
@@ -1427,7 +1892,6 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_users":
-
         con = db()
 
         rows = con.execute("""
@@ -1435,6 +1899,7 @@ async def callbacks(
                 user_id,
                 username,
                 first_name,
+                wallet_balance,
                 created_at
             FROM users
             ORDER BY created_at DESC
@@ -1448,42 +1913,30 @@ async def callbacks(
         con.close()
 
         lines = [
-
             f"👥 <b>کاربران</b> — مجموع: {total}",
-
             "━━━━━━━━━━━━━━━━━━"
-
         ]
 
         for row in rows:
-
             username = (
-
                 f"@{row['username']}"
-
                 if row["username"]
-
                 else "بدون یوزرنیم"
             )
 
             lines.append(
-
-                f"👤 {row['first_name'] or 'بدون نام'}\n"
+                f"👤 {escape(row['first_name'] or 'بدون نام')}\n"
                 f"🆔 <code>{row['user_id']}</code>\n"
-                f"🔗 {username}\n"
+                f"🔗 {escape(username)}\n"
+                f"💰 {format_price(row['wallet_balance'] or 0)}\n"
                 f"━━━━━━━━━━━━━━━━━━"
-
             )
 
         await q.edit_message_text(
-
             "\n".join(lines),
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=admin_menu()
         )
-
         return
 
     # =====================================================
@@ -1491,7 +1944,6 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_services":
-
         con = db()
 
         rows = con.execute("""
@@ -1514,21 +1966,14 @@ async def callbacks(
         con.close()
 
         lines = [
-
             f"📦 <b>سرویس‌ها</b> — مجموع: {total}",
-
             "━━━━━━━━━━━━━━━━━━"
-
         ]
 
         for row in rows:
-
             plan = PLANS.get(
                 row["plan_key"],
-                {
-                    "name":
-                    row["plan_key"]
-                }
+                {"name": row["plan_key"]}
             )
 
             status = (
@@ -1538,25 +1983,72 @@ async def callbacks(
             )
 
             lines.append(
-
                 f"🛰 {plan['name']}\n"
                 f"👤 <code>{row['user_id']}</code>\n"
-                f"🔑 <code>{row['code']}</code>\n"
+                f"🔑 <code>{escape(str(row['code']))}</code>\n"
                 f"{status}\n"
                 f"📅 {jalali_date(row['expires_at'])}\n"
                 f"━━━━━━━━━━━━━━━━━━"
-
             )
 
         await q.edit_message_text(
-
             "\n".join(lines),
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=admin_menu()
         )
+        return
 
+    # =====================================================
+    # ADMIN WALLET DEPOSITS
+    # =====================================================
+
+    if data == "admin_wallet":
+        con = db()
+
+        rows = con.execute("""
+            SELECT
+                id,
+                user_id,
+                amount,
+                status,
+                created_at
+            FROM wallet_deposits
+            ORDER BY id DESC
+            LIMIT 15
+        """).fetchall()
+
+        con.close()
+
+        if not rows:
+            text = """
+💰 <b>شارژهای کیف پول</b>
+
+━━━━━━━━━━━━━━━━━━
+
+📭 هنوز درخواست شارژی ثبت نشده.
+"""
+        else:
+            lines = [
+                "💰 <b>آخرین شارژهای کیف پول</b>",
+                "━━━━━━━━━━━━━━━━━━"
+            ]
+
+            for row in rows:
+                lines.append(
+                    f"💳 <b>#{row['id']}</b>\n"
+                    f"👤 <code>{row['user_id']}</code>\n"
+                    f"💵 {format_price(row['amount'])}\n"
+                    f"📌 {escape(row['status'])}\n"
+                    f"━━━━━━━━━━━━━━━━━━"
+                )
+
+            text = "\n".join(lines)
+
+        await q.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_menu()
+        )
         return
 
     # =====================================================
@@ -1564,13 +2056,12 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_deliver":
-
-        context.user_data[
-            "awaiting_delivery"
-        ] = True
+        context.user_data["awaiting_delivery"] = True
+        context.user_data["awaiting_receipt_order_id"] = None
+        context.user_data["awaiting_wallet_amount"] = False
+        context.user_data["awaiting_wallet_receipt"] = False
 
         await q.edit_message_text(
-
             """
 ➕ <b>تحویل دستی سرویس</b>
 
@@ -1592,20 +2083,571 @@ async def callbacks(
 <code>p100</code> → 100 گیگ
 <code>p200</code> → 200 گیگ
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
                 [
                     InlineKeyboardButton(
                         "🔙 پنل مدیریت",
                         callback_data="admin_home"
                     )
                 ]
-
             ])
         )
+        return
+
+    # =====================================================
+    # ADMIN APPROVE ORDER RECEIPT
+    # =====================================================
+
+    if data.startswith("receipt_approve:"):
+        try:
+            receipt_id = int(
+                data.split(":", 1)[1]
+            )
+        except ValueError:
+            return
+
+        receipt, new_balance, status = approve_payment_receipt(
+            receipt_id,
+            ADMIN_ID
+        )
+
+        if status == "not_found":
+            await q.edit_message_caption(
+                caption="❌ رسید پیدا نشد."
+            )
+            return
+
+        if status == "already_processed":
+            await q.edit_message_caption(
+                caption=(
+                    "⚠️ این رسید قبلاً بررسی شده است.\n"
+                    "از شارژ دوباره کیف پول جلوگیری شد."
+                )
+            )
+            return
+
+        await q.edit_message_caption(
+            caption=(
+                "✅ <b>رسید تأیید شد</b>\n\n"
+                f"🧾 سفارش: #{receipt['order_id']}\n"
+                f"👤 کاربر: <code>{receipt['user_id']}</code>\n"
+                f"💰 مبلغ: {format_price(receipt['amount'])}\n"
+                f"💳 موجودی جدید: {format_price(new_balance)}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=receipt["user_id"],
+                text=f"""
+✅ <b>پرداخت شما تأیید شد</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🧾 سفارش:
+<code>#{receipt['order_id']}</code>
+
+💰 مبلغ اضافه‌شده:
+<b>{format_price(receipt['amount'])}</b>
+
+💳 موجودی جدید کیف پول:
+<b>{format_price(new_balance)}</b>
+
+مبلغ پرداختی با موفقیت به کیف پول شما اضافه شد.
+""",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+        return
+
+    # =====================================================
+    # ADMIN REJECT ORDER RECEIPT
+    # =====================================================
+
+    if data.startswith("receipt_reject:"):
+        try:
+            receipt_id = int(
+                data.split(":", 1)[1]
+            )
+        except ValueError:
+            return
+
+        receipt, status = reject_payment_receipt(
+            receipt_id,
+            ADMIN_ID
+        )
+
+        if status == "not_found":
+            await q.edit_message_caption(
+                caption="❌ رسید پیدا نشد."
+            )
+            return
+
+        if status == "already_processed":
+            await q.edit_message_caption(
+                caption="⚠️ این رسید قبلاً بررسی شده است."
+            )
+            return
+
+        await q.edit_message_caption(
+            caption=(
+                "❌ <b>رسید رد شد</b>\n\n"
+                f"🧾 سفارش: #{receipt['order_id']}\n"
+                f"👤 کاربر: <code>{receipt['user_id']}</code>\n"
+                f"💰 مبلغ: {format_price(receipt['amount'])}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=receipt["user_id"],
+                text=f"""
+❌ <b>رسید پرداخت تأیید نشد</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🧾 سفارش:
+<code>#{receipt['order_id']}</code>
+
+💰 مبلغ:
+<b>{format_price(receipt['amount'])}</b>
+
+رسید توسط ادمین تأیید نشد.
+در صورت اشتباه، لطفاً رسید صحیح را دوباره ارسال کن.
+""",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "📤 ارسال مجدد رسید",
+                            callback_data=f"receipt:{receipt['order_id']}"
+                        )
+                    ]
+                ])
+            )
+        except Exception:
+            pass
+
+        return
+
+    # =====================================================
+    # ADMIN APPROVE WALLET DEPOSIT
+    # =====================================================
+
+    if data.startswith("wallet_approve:"):
+        try:
+            deposit_id = int(
+                data.split(":", 1)[1]
+            )
+        except ValueError:
+            return
+
+        deposit, new_balance, status = approve_wallet_deposit(
+            deposit_id,
+            ADMIN_ID
+        )
+
+        if status == "not_found":
+            await q.edit_message_caption(
+                caption="❌ درخواست شارژ پیدا نشد."
+            )
+            return
+
+        if status == "already_processed":
+            await q.edit_message_caption(
+                caption=(
+                    "⚠️ این درخواست قبلاً بررسی شده است.\n"
+                    "از شارژ دوباره کیف پول جلوگیری شد."
+                )
+            )
+            return
+
+        await q.edit_message_caption(
+            caption=(
+                "✅ <b>شارژ کیف پول تأیید شد</b>\n\n"
+                f"💳 درخواست: #{deposit['id']}\n"
+                f"👤 کاربر: <code>{deposit['user_id']}</code>\n"
+                f"💰 مبلغ: {format_price(deposit['amount'])}\n"
+                f"💳 موجودی جدید: {format_price(new_balance)}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=deposit["user_id"],
+                text=f"""
+✅ <b>شارژ کیف پول تأیید شد</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ اضافه‌شده:
+<b>{format_price(deposit['amount'])}</b>
+
+💳 موجودی جدید:
+<b>{format_price(new_balance)}</b>
+
+مبلغ با موفقیت به کیف پول شما اضافه شد.
+""",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+        return
+
+    # =====================================================
+    # ADMIN REJECT WALLET DEPOSIT
+    # =====================================================
+
+    if data.startswith("wallet_reject:"):
+        try:
+            deposit_id = int(
+                data.split(":", 1)[1]
+            )
+        except ValueError:
+            return
+
+        deposit, status = reject_wallet_deposit(
+            deposit_id,
+            ADMIN_ID
+        )
+
+        if status == "not_found":
+            await q.edit_message_caption(
+                caption="❌ درخواست شارژ پیدا نشد."
+            )
+            return
+
+        if status == "already_processed":
+            await q.edit_message_caption(
+                caption="⚠️ این درخواست قبلاً بررسی شده است."
+            )
+            return
+
+        await q.edit_message_caption(
+            caption=(
+                "❌ <b>درخواست شارژ رد شد</b>\n\n"
+                f"💳 درخواست: #{deposit['id']}\n"
+                f"👤 کاربر: <code>{deposit['user_id']}</code>\n"
+                f"💰 مبلغ: {format_price(deposit['amount'])}"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=deposit["user_id"],
+                text=f"""
+❌ <b>شارژ کیف پول تأیید نشد</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ:
+<b>{format_price(deposit['amount'])}</b>
+
+رسید پرداخت توسط ادمین تأیید نشد.
+اگر اشتباهی رخ داده، می‌توانی دوباره درخواست شارژ ثبت کنی.
+""",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+
+        return
+
+
+# =========================================================
+# PHOTO / RECEIPT HANDLER
+# =========================================================
+
+async def photo_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    user_id = update.effective_user.id
+
+    # =====================================================
+    # ADMIN RECEIPT DOES NOT ENTER USER FLOW
+    # =====================================================
+
+    if user_id == ADMIN_ID:
+        return
+
+    ensure_user(update.effective_user)
+
+    # =====================================================
+    # ORDER RECEIPT
+    # =====================================================
+
+    order_id = context.user_data.get(
+        "awaiting_receipt_order_id"
+    )
+
+    if order_id:
+        con = db()
+
+        order = con.execute(
+            "SELECT * FROM orders WHERE id=?",
+            (order_id,)
+        ).fetchone()
+
+        con.close()
+
+        if not order or order["user_id"] != user_id:
+            context.user_data["awaiting_receipt_order_id"] = None
+
+            await update.message.reply_text(
+                "❌ سفارش پیدا نشد."
+            )
+            return
+
+        if order["status"] == "paid":
+            context.user_data["awaiting_receipt_order_id"] = None
+
+            await update.message.reply_text(
+                "✅ این سفارش قبلاً پرداخت و تأیید شده است."
+            )
+            return
+
+        if has_pending_order_receipt(order_id):
+            context.user_data["awaiting_receipt_order_id"] = None
+
+            await update.message.reply_text(
+                "⏳ رسید این سفارش قبلاً ارسال شده و در انتظار بررسی ادمین است."
+            )
+            return
+
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+
+        receipt_id = create_payment_receipt(
+            order_id,
+            user_id,
+            order["amount"],
+            file_id
+        )
+
+        context.user_data["awaiting_receipt_order_id"] = None
+
+        await update.message.reply_text(
+            f"""
+✅ <b>رسید دریافت شد</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🧾 سفارش:
+<code>#{order_id}</code>
+
+💰 مبلغ:
+<b>{format_price(order['amount'])}</b>
+
+⏳ رسید برای بررسی ادمین ارسال شد.
+
+بعد از تأیید، مبلغ پرداختی به کیف پولت اضافه می‌شود.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+
+        plan = PLANS.get(
+            order["plan_key"],
+            {"name": order["plan_key"]}
+        )
+
+        username = (
+            f"@{update.effective_user.username}"
+            if update.effective_user.username
+            else "ندارد"
+        )
+
+        admin_caption = f"""
+🧾 <b>رسید پرداخت سفارش جدید</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🔢 Receipt ID:
+<code>{receipt_id}</code>
+
+🧾 سفارش:
+<code>#{order_id}</code>
+
+👤 نام:
+{escape(update.effective_user.first_name or '—')}
+
+🔗 یوزرنیم:
+{escape(username)}
+
+🆔 User ID:
+<code>{user_id}</code>
+
+⚡ پلن:
+<b>{escape(plan['name'])}</b>
+
+💰 مبلغ:
+<b>{format_price(order['amount'])}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+برای تأیید یا رد رسید از دکمه‌های زیر استفاده کن.
+"""
+
+        try:
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=file_id,
+                caption=admin_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "✅ تأیید و شارژ کیف پول",
+                            callback_data=f"receipt_approve:{receipt_id}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ رد رسید",
+                            callback_data=f"receipt_reject:{receipt_id}"
+                        )
+                    ],
+                ])
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"""
+⚠️ رسید ثبت شد اما ارسال آن برای ادمین با مشکل مواجه شد.
+
+خطا:
+<code>{escape(str(e))}</code>
+""",
+                parse_mode=ParseMode.HTML
+            )
+
+        return
+
+    # =====================================================
+    # WALLET RECEIPT
+    # =====================================================
+
+    wallet_amount = context.user_data.get(
+        "wallet_amount"
+    )
+
+    if wallet_amount:
+        amount = int(wallet_amount)
+
+        if amount <= 0:
+            context.user_data["wallet_amount"] = None
+
+            await update.message.reply_text(
+                "❌ مبلغ نامعتبر است. دوباره از بخش شارژ کیف پول اقدام کن."
+            )
+            return
+
+        if has_pending_wallet_deposit(user_id):
+            context.user_data["wallet_amount"] = None
+
+            await update.message.reply_text(
+                "⏳ یک درخواست شارژ قبلی هنوز در انتظار بررسی ادمین است."
+            )
+            return
+
+        photo = update.message.photo[-1]
+        file_id = photo.file_id
+
+        deposit_id = create_wallet_deposit(
+            user_id,
+            amount,
+            file_id
+        )
+
+        context.user_data["wallet_amount"] = None
+
+        await update.message.reply_text(
+            f"""
+✅ <b>رسید شارژ کیف پول دریافت شد</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ درخواست:
+<b>{format_price(amount)}</b>
+
+⏳ رسید برای بررسی ادمین ارسال شد.
+
+بعد از تأیید، دقیقاً همین مبلغ به کیف پولت اضافه می‌شود.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+
+        username = (
+            f"@{update.effective_user.username}"
+            if update.effective_user.username
+            else "ندارد"
+        )
+
+        admin_caption = f"""
+💰 <b>درخواست شارژ کیف پول</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🔢 Deposit ID:
+<code>{deposit_id}</code>
+
+👤 نام:
+{escape(update.effective_user.first_name or '—')}
+
+🔗 یوزرنیم:
+{escape(username)}
+
+🆔 User ID:
+<code>{user_id}</code>
+
+💵 مبلغ درخواستی:
+<b>{format_price(amount)}</b>
+
+━━━━━━━━━━━━━━━━━━
+
+با تأیید، دقیقاً همین مبلغ به کیف پول کاربر اضافه می‌شود.
+"""
+
+        try:
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=file_id,
+                caption=admin_caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "✅ تأیید و شارژ کیف پول",
+                            callback_data=f"wallet_approve:{deposit_id}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ رد رسید",
+                            callback_data=f"wallet_reject:{deposit_id}"
+                        )
+                    ],
+                ])
+            )
+        except Exception as e:
+            await update.message.reply_text(
+                f"""
+⚠️ درخواست ثبت شد اما ارسال آن برای ادمین با مشکل مواجه شد.
+
+خطا:
+<code>{escape(str(e))}</code>
+""",
+                parse_mode=ParseMode.HTML
+            )
 
         return
 
@@ -1618,9 +2660,7 @@ async def text_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     user_id = update.effective_user.id
-
     text = update.message.text.strip()
 
     # =====================================================
@@ -1629,22 +2669,13 @@ async def text_handler(
 
     if (
         user_id == ADMIN_ID
-        and context.user_data.get(
-            "awaiting_delivery"
-        )
+        and context.user_data.get("awaiting_delivery")
     ):
-
         raw = text
-
-        parts = raw.split(
-            "|",
-            2
-        )
+        parts = raw.split("|", 2)
 
         if len(parts) != 3:
-
             await update.message.reply_text(
-
                 """
 ❌ فرمت اشتباه است.
 
@@ -1656,56 +2687,40 @@ async def text_handler(
 
 <code>123456789|p50|vless://...</code>
 """,
-
                 parse_mode=ParseMode.HTML
             )
-
             return
 
         try:
-
             target_user_id = int(
                 parts[0].strip()
             )
-
         except ValueError:
-
             await update.message.reply_text(
                 "❌ USER_ID باید عدد باشد."
             )
-
             return
 
         plan_key = parts[1].strip()
-
         config = parts[2].strip()
 
         if plan_key not in PLANS:
-
             await update.message.reply_text(
                 "❌ PLAN_KEY نامعتبر است."
             )
-
             return
 
         service_id, code = create_service(
-
             target_user_id,
             plan_key,
             config
-
         )
 
-        context.user_data[
-            "awaiting_delivery"
-        ] = False
+        context.user_data["awaiting_delivery"] = False
 
-        plan = PLANS[
-            plan_key
-        ]
+        plan = PLANS[plan_key]
 
         await update.message.reply_text(
-
             f"""
 ✅ <b>سرویس ساخته شد</b>
 
@@ -1725,16 +2740,12 @@ async def text_handler(
 
 📨 کانفیگ برای کاربر ارسال می‌شود.
 """,
-
             parse_mode=ParseMode.HTML
         )
 
         try:
-
             await context.bot.send_message(
-
                 chat_id=target_user_id,
-
                 text=f"""
 🎉 <b>سرویس شما آماده شد</b>
 
@@ -1756,60 +2767,184 @@ async def text_handler(
 
 <b>🔐 کانفیگ:</b>
 
-<code>{config}</code>
+<code>{escape(config)}</code>
 
 ━━━━━━━━━━━━━━━━━━
 
 برای مشاهده سرویس‌های خودت،
 وارد بخش «📡 سرویس های من» شو.
 """,
-
                 parse_mode=ParseMode.HTML
             )
 
         except Exception as e:
-
             await update.message.reply_text(
-
                 f"""
 ⚠️ سرویس ساخته شد،
 اما ارسال به کاربر ناموفق بود.
 
 خطا:
 
-<code>{str(e)}</code>
+<code>{escape(str(e))}</code>
 """,
-
                 parse_mode=ParseMode.HTML
             )
 
         return
 
     # =====================================================
-    # USER PANEL
+    # ADMIN SHOULD NOT USE USER PANEL
     # =====================================================
 
-    ensure_user(
-        update.effective_user
-    )
+    if user_id == ADMIN_ID:
+        return
+
+    ensure_user(update.effective_user)
+
+    # =====================================================
+    # WALLET AMOUNT INPUT
+    # =====================================================
+
+    if context.user_data.get("awaiting_wallet_amount"):
+        normalized = (
+            text
+            .replace(",", "")
+            .replace("٬", "")
+            .replace(" ", "")
+        )
+
+        if not normalized.isdigit():
+            await update.message.reply_text(
+                """
+❌ مبلغ نامعتبر است.
+
+لطفاً فقط عدد وارد کن.
+
+مثال:
+<code>500000</code>
+""",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        amount = int(normalized)
+
+        if amount < 1000:
+            await update.message.reply_text(
+                "❌ حداقل مبلغ شارژ ۱٬۰۰۰ تومان است."
+            )
+            return
+
+        if amount > 1_000_000_000:
+            await update.message.reply_text(
+                "❌ مبلغ واردشده بیش از حد مجاز است."
+            )
+            return
+
+        if has_pending_wallet_deposit(user_id):
+            context.user_data["awaiting_wallet_amount"] = False
+
+            await update.message.reply_text(
+                """
+⏳ یک درخواست شارژ قبلی هنوز در انتظار بررسی ادمین است.
+
+لطفاً تا تعیین تکلیف درخواست قبلی صبر کن.
+""",
+                reply_markup=user_panel()
+            )
+            return
+
+        context.user_data["awaiting_wallet_amount"] = False
+        context.user_data["wallet_amount"] = amount
+
+        await update.message.reply_text(
+            card_payment_text(
+                "شارژ کیف پول",
+                amount,
+                extra=(
+                    "💰 مبلغی که وارد کردی ثبت شد."
+                )
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📤 ارسال رسید",
+                        callback_data="wallet_send_receipt"
+                    )
+                ],
+                [
+                    back_button("profile")
+                ]
+            ])
+        )
+        return
 
     # =====================================================
     # PROFILE
     # =====================================================
 
     if text == "👤 پروفایل و کیف پول":
+        await update.message.reply_text(
+            profile_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💰 شارژ کیف پول",
+                        callback_data="wallet_topup"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📡 سرویس های من",
+                        callback_data="services"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🎁 دعوت و دریافت رایگان",
+                        callback_data="ref"
+                    )
+                ],
+                [
+                    back_button("home")
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # DIRECT WALLET TOP-UP BUTTON
+    # =====================================================
+
+    if text == "💰 شارژ کیف پول":
+        context.user_data["awaiting_wallet_amount"] = True
+        context.user_data["wallet_amount"] = None
+        context.user_data["awaiting_receipt_order_id"] = None
 
         await update.message.reply_text(
+            """
+💰 <b>شارژ کیف پول</b>
 
-            profile_text(
-                user_id
-            ),
+━━━━━━━━━━━━━━━━━━
 
+مبلغ دلخواهت را به تومان وارد کن.
+
+مثال:
+
+<code>500000</code>
+
+━━━━━━━━━━━━━━━━━━
+
+بعد از وارد کردن مبلغ، شماره کارت نمایش داده می‌شود
+و می‌توانی رسید پرداخت را ارسال کنی.
+""",
             parse_mode=ParseMode.HTML,
-
-            reply_markup=user_panel()
+            reply_markup=InlineKeyboardMarkup([
+                [back_button("profile")]
+            ])
         )
-
         return
 
     # =====================================================
@@ -1817,9 +2952,7 @@ async def text_handler(
     # =====================================================
 
     if text == "🛒 فروشگاه اشتراک‌ها":
-
         await update.message.reply_text(
-
             """
 🛒 <b>فروشگاه اشتراک‌ها</b>
 
@@ -1827,14 +2960,9 @@ async def text_handler(
 
 پلن موردنظر خودت را انتخاب کن:
 """,
-
             parse_mode=ParseMode.HTML,
-
-            reply_markup=plans_menu(
-                "plan"
-            )
+            reply_markup=plans_menu("plan")
         )
-
         return
 
     # =====================================================
@@ -1842,31 +2970,21 @@ async def text_handler(
     # =====================================================
 
     if text == "📡 سرویس های من":
-
         await update.message.reply_text(
-
-            services_text(
-                user_id
-            ),
-
+            services_text(user_id),
             parse_mode=ParseMode.HTML,
-
             reply_markup=InlineKeyboardMarkup([
-
                 [
                     InlineKeyboardButton(
                         "🔄 تمدید سرویس",
                         callback_data="renew"
                     )
                 ],
-
                 [
                     back_button("home")
                 ]
-
             ])
         )
-
         return
 
     # =====================================================
@@ -1874,10 +2992,7 @@ async def text_handler(
     # =====================================================
 
     if text == "🎁 دعوت و دریافت رایگان":
-
-        bot_username = (
-            context.bot.username
-        )
+        bot_username = context.bot.username
 
         link = (
             f"https://t.me/"
@@ -1886,7 +3001,6 @@ async def text_handler(
         )
 
         await update.message.reply_text(
-
             f"""
 🎁 <b>دعوت و دریافت رایگان</b>
 
@@ -1894,7 +3008,7 @@ async def text_handler(
 
 لینک اختصاصی شما:
 
-<code>{link}</code>
+<code>{escape(link)}</code>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1906,12 +3020,9 @@ async def text_handler(
 🎁 سیستم پاداش و اعتبار دعوت
 در مرحله بعد قابل فعال‌سازی است.
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=user_panel()
         )
-
         return
 
     # =====================================================
@@ -1919,9 +3030,7 @@ async def text_handler(
     # =====================================================
 
     if text == "📖 آموزش و راهنما":
-
         await update.message.reply_text(
-
             """
 📖 <b>آموزش و راهنما</b>
 
@@ -1940,12 +3049,9 @@ async def text_handler(
 اگر مشکلی داشتی، از بخش
 «🛟 تماس با پشتیبانی» استفاده کن.
 """,
-
             parse_mode=ParseMode.HTML,
-
             reply_markup=user_panel()
         )
-
         return
 
     # =====================================================
@@ -1953,32 +3059,52 @@ async def text_handler(
     # =====================================================
 
     if text == "🛟 تماس با پشتیبانی":
+        if (
+            SUPPORT_STICKER_ID
+            and SUPPORT_STICKER_ID != "PASTE_STICKER_FILE_ID_HERE"
+        ):
+            try:
+                await update.message.reply_sticker(
+                    SUPPORT_STICKER_ID
+                )
+            except Exception:
+                pass
 
         await update.message.reply_text(
-
-            f"""
+            """
 🛟 <b>تماس با پشتیبانی</b>
 
 ━━━━━━━━━━━━━━━━━━
 
 اگر در خرید یا سرویس مشکلی داری،
-با پشتیبانی در ارتباط باش:
-
-👤 {SUPPORT_USERNAME}
-
-━━━━━━━━━━━━━━━━━━
-
-هنگام ارسال پیام، اگر مربوط به
-سرویس یا سفارش خاصی است، کد سرویس
-یا شماره سفارش را هم ارسال کن.
+از دکمه زیر با پشتیبانی تماس بگیر.
 """,
-
             parse_mode=ParseMode.HTML,
-
-            reply_markup=user_panel()
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💬 تماس با پشتیبانی",
+                        url=(
+                            "https://t.me/"
+                            + SUPPORT_USERNAME.lstrip("@")
+                        )
+                    )
+                ]
+            ])
         )
-
         return
+
+
+# =========================================================
+# RECEIPT BUTTON CALLBACK
+# =========================================================
+
+async def receipt_button_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    # این تابع دیگر استفاده نمی‌شود؛ منطق در callbacks است.
+    pass
 
 
 # =========================================================
@@ -1989,7 +3115,6 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     print(
         "BOT ERROR:",
         repr(context.error)
@@ -2001,7 +3126,6 @@ async def error_handler(
 # =========================================================
 
 def main():
-
     init_db()
 
     app = (
@@ -2028,6 +3152,14 @@ def main():
     app.add_handler(
         CallbackQueryHandler(
             callbacks
+        )
+    )
+
+    # اول عکس، بعد متن
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
         )
     )
 
