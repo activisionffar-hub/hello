@@ -22,9 +22,9 @@ from telegram.ext import (
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@your_support")
+BOT_TOKEN = os.getenv("8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g", "").strip()
+ADMIN_ID = int(os.getenv("8815017184", "0") or 0)
+SUPPORT_USERNAME = os.getenv("8815017184", "@kaletek_Support")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 if not BOT_TOKEN:
