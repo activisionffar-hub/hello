@@ -3,8 +3,17 @@ import secrets
 from datetime import datetime, timedelta
 
 import jdatetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+
 from telegram.constants import ParseMode
+
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,6 +22,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
 
 # =========================================================
 # CONFIG
@@ -42,12 +52,14 @@ PLANS = {
         "days": 30,
         "price": 89000,
     },
+
     "p100": {
         "name": "100 گیگ",
         "gb": 100,
         "days": 30,
         "price": 149000,
     },
+
     "p200": {
         "name": "200 گیگ",
         "gb": 200,
@@ -68,6 +80,7 @@ def db():
 
 
 def init_db():
+
     con = db()
     cur = con.cursor()
 
@@ -113,6 +126,7 @@ def init_db():
 
 
 def ensure_user(tg_user, referred_by=None):
+
     con = db()
     cur = con.cursor()
 
@@ -122,11 +136,26 @@ def ensure_user(tg_user, referred_by=None):
     ).fetchone()
 
     if not row:
+
         ref_code = secrets.token_hex(4).upper()
+
+        while cur.execute(
+            "SELECT 1 FROM users WHERE ref_code=?",
+            (ref_code,)
+        ).fetchone():
+
+            ref_code = secrets.token_hex(4).upper()
 
         cur.execute("""
             INSERT INTO users
-            (user_id, username, first_name, ref_code, referred_by, created_at)
+            (
+                user_id,
+                username,
+                first_name,
+                ref_code,
+                referred_by,
+                created_at
+            )
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
             tg_user.id,
@@ -136,10 +165,13 @@ def ensure_user(tg_user, referred_by=None):
             referred_by,
             datetime.now().isoformat(timespec="seconds"),
         ))
+
     else:
+
         cur.execute("""
             UPDATE users
-            SET username=?, first_name=?
+            SET username=?,
+                first_name=?
             WHERE user_id=?
         """, (
             tg_user.username or "",
@@ -152,16 +184,21 @@ def ensure_user(tg_user, referred_by=None):
 
 
 def get_user(user_id):
+
     con = db()
+
     row = con.execute(
         "SELECT * FROM users WHERE user_id=?",
         (user_id,)
     ).fetchone()
+
     con.close()
+
     return row
 
 
 def get_services(user_id):
+
     con = db()
 
     rows = con.execute("""
@@ -172,10 +209,12 @@ def get_services(user_id):
     """, (user_id,)).fetchall()
 
     con.close()
+
     return rows
 
 
 def create_order(user_id, plan_key):
+
     plan = PLANS[plan_key]
 
     con = db()
@@ -183,7 +222,12 @@ def create_order(user_id, plan_key):
 
     cur.execute("""
         INSERT INTO orders
-        (user_id, plan_key, amount, created_at)
+        (
+            user_id,
+            plan_key,
+            amount,
+            created_at
+        )
         VALUES (?, ?, ?, ?)
     """, (
         user_id,
@@ -201,12 +245,18 @@ def create_order(user_id, plan_key):
 
 
 def create_service(user_id, plan_key, config):
+
     plan = PLANS[plan_key]
 
     now = datetime.now()
-    expires = now + timedelta(days=plan["days"])
 
-    code = str(secrets.randbelow(9000) + 1000)
+    expires = now + timedelta(
+        days=plan["days"]
+    )
+
+    code = str(
+        secrets.randbelow(9000) + 1000
+    )
 
     con = db()
 
@@ -214,7 +264,10 @@ def create_service(user_id, plan_key, config):
         "SELECT 1 FROM services WHERE code=?",
         (code,)
     ).fetchone():
-        code = str(secrets.randbelow(9000) + 1000)
+
+        code = str(
+            secrets.randbelow(9000) + 1000
+        )
 
     cur = con.cursor()
 
@@ -253,20 +306,31 @@ def create_service(user_id, plan_key, config):
 # =========================================================
 
 def format_price(number):
-    return f"{number:,}".replace(",", "٬") + " تومان"
+
+    return (
+        f"{number:,}"
+        .replace(",", "٬")
+        + " تومان"
+    )
 
 
 def jalali_date(iso_date):
-    dt = datetime.fromisoformat(iso_date)
+
+    dt = datetime.fromisoformat(
+        iso_date
+    )
 
     j = jdatetime.datetime.fromgregorian(
         datetime=dt
     )
 
-    return j.strftime("%Y/%m/%d %H:%M")
+    return j.strftime(
+        "%Y/%m/%d %H:%M"
+    )
 
 
 def back_button(target="home"):
+
     return InlineKeyboardButton(
         "🔙 بازگشت",
         callback_data=target
@@ -274,55 +338,61 @@ def back_button(target="home"):
 
 
 # =========================================================
-# USER PANEL
+# MAIN USER PANEL
 # =========================================================
 
-def main_menu():
+def user_panel():
 
-    return InlineKeyboardMarkup([
-
-        [
-            InlineKeyboardButton(
-                "🛒 خرید سرویس",
-                callback_data="buy"
-            ),
-            InlineKeyboardButton(
-                "📦 سرویس‌های من",
-                callback_data="services"
-            ),
-        ],
+    return ReplyKeyboardMarkup(
 
         [
-            InlineKeyboardButton(
-                "🔄 تمدید سرویس",
-                callback_data="renew"
-            ),
-            InlineKeyboardButton(
-                "👤 حساب من",
-                callback_data="profile"
-            ),
+
+            [
+                KeyboardButton(
+                    "👤 پروفایل و کیف پول"
+                ),
+
+                KeyboardButton(
+                    "🛒 فروشگاه اشتراک‌ها"
+                ),
+            ],
+
+            [
+                KeyboardButton(
+                    "📡 سرویس های من"
+                ),
+            ],
+
+            [
+                KeyboardButton(
+                    "🎁 دعوت و دریافت رایگان"
+                ),
+            ],
+
+            [
+                KeyboardButton(
+                    "📖 آموزش و راهنما"
+                ),
+
+                KeyboardButton(
+                    "🛟 تماس با پشتیبانی"
+                ),
+            ],
+
         ],
 
-        [
-            InlineKeyboardButton(
-                "🎁 دعوت دوستان",
-                callback_data="ref"
-            ),
-            InlineKeyboardButton(
-                "📚 آموزش",
-                callback_data="guide"
-            ),
-        ],
+        resize_keyboard=True,
+        is_persistent=True,
 
-        [
-            InlineKeyboardButton(
-                "💬 پشتیبانی",
-                callback_data="support"
-            ),
-        ],
+        input_field_placeholder=(
+            "یک گزینه را انتخاب کنید..."
+        )
+    )
 
-    ])
 
+# =========================================================
+# INLINE PLANS
+# =========================================================
 
 def plans_menu(prefix="plan"):
 
@@ -331,21 +401,28 @@ def plans_menu(prefix="plan"):
     for key, plan in PLANS.items():
 
         buttons.append([
+
             InlineKeyboardButton(
-                f"⚡ {plan['name']} • {format_price(plan['price'])}",
+
+                f"⚡ {plan['name']} • "
+                f"{format_price(plan['price'])}",
+
                 callback_data=f"{prefix}:{key}"
             )
+
         ])
 
     buttons.append([
         back_button("home")
     ])
 
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(
+        buttons
+    )
 
 
 # =========================================================
-# ADMIN PANEL
+# ADMIN MENU
 # =========================================================
 
 def admin_menu():
@@ -353,54 +430,65 @@ def admin_menu():
     return InlineKeyboardMarkup([
 
         [
+
             InlineKeyboardButton(
                 "📊 آمار",
                 callback_data="admin_stats"
             ),
+
             InlineKeyboardButton(
                 "📋 سفارش‌ها",
                 callback_data="admin_orders"
             ),
+
         ],
 
         [
+
             InlineKeyboardButton(
                 "👥 کاربران",
                 callback_data="admin_users"
             ),
+
             InlineKeyboardButton(
                 "📦 سرویس‌ها",
                 callback_data="admin_services"
             ),
+
         ],
 
         [
+
             InlineKeyboardButton(
                 "➕ تحویل سرویس",
                 callback_data="admin_deliver"
             ),
+
         ],
 
         [
+
             InlineKeyboardButton(
                 "🏠 پنل کاربری",
                 callback_data="home"
             ),
+
         ],
 
     ])
 
 
 # =========================================================
-# TEXTS
+# WELCOME
 # =========================================================
 
 WELCOME = """
-<b>🚀 VPN STORE</b>
+🖥 <b>پنل کاربری</b>
 
 ━━━━━━━━━━━━━━━━━━
 
 سلام 👋
+
 به فروشگاه آنلاین سرویس خوش اومدی.
 
 ⚡ تحویل سریع
@@ -409,32 +497,35 @@ WELCOME = """
 💳 خرید آسان
 💬 پشتیبانی
 
-از منوی زیر انتخاب کن:
+از منوی پایین انتخاب کن:
 """
 
 
 # =========================================================
-# USER PAGES
+# SERVICES TEXT
 # =========================================================
 
 def services_text(user_id):
 
-    services = get_services(user_id)
+    services = get_services(
+        user_id
+    )
 
     if not services:
+
         return """
-📦 <b>سرویس‌های من</b>
+📡 <b>سرویس های من</b>
 
 ━━━━━━━━━━━━━━━━━━
 
 📭 هنوز سرویسی برای حساب شما ثبت نشده.
 
 برای خرید اولین سرویس روی
-«🛒 خرید سرویس» بزنید.
+«🛒 فروشگاه اشتراک‌ها» بزنید.
 """
 
     lines = [
-        "📦 <b>سرویس‌های من</b>",
+        "📡 <b>سرویس های من</b>",
         "━━━━━━━━━━━━━━━━━━"
     ]
 
@@ -448,39 +539,74 @@ def services_text(user_id):
 
         plan = PLANS.get(
             service["plan_key"],
-            {"name": service["plan_key"]}
+            {
+                "name":
+                service["plan_key"]
+            }
         )
 
         lines.extend([
+
             f"🛰 <b>{plan['name']}</b>",
-            f"🔑 کد سرویس: <code>{service['code']}</code>",
+
+            f"🔑 کد سرویس: "
+            f"<code>{service['code']}</code>",
+
             f"📊 وضعیت: {status}",
-            f"📦 حجم: {service['total_gb']} GB",
-            f"📅 انقضا: {jalali_date(service['expires_at'])}",
-            f"🛒 خرید: {jalali_date(service['purchased_at'])}",
+
+            f"📦 حجم: "
+            f"{service['total_gb']} GB",
+
+            f"📅 انقضا: "
+            f"{jalali_date(service['expires_at'])}",
+
+            f"🛒 خرید: "
+            f"{jalali_date(service['purchased_at'])}",
+
             "━━━━━━━━━━━━━━━━━━",
+
         ])
 
     return "\n".join(lines)
 
 
+# =========================================================
+# PROFILE
+# =========================================================
+
 def profile_text(user_id):
 
-    user = get_user(user_id)
-    services = get_services(user_id)
+    user = get_user(
+        user_id
+    )
+
+    services = get_services(
+        user_id
+    )
+
+    if not user:
+
+        return (
+            "❌ اطلاعات حساب پیدا نشد."
+        )
 
     active_services = sum(
-        1 for x in services if x["active"]
+        1
+        for service in services
+        if service["active"]
     )
 
     username = (
+
         f"@{user['username']}"
+
         if user["username"]
+
         else "ندارد"
     )
 
     return f"""
-👤 <b>حساب کاربری</b>
+👤 <b>پروفایل و کیف پول</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -499,6 +625,9 @@ def profile_text(user_id):
 🟢 سرویس فعال:
 <b>{active_services}</b>
 
+💰 موجودی کیف پول:
+<b>0 تومان</b>
+
 🎁 کد دعوت:
 <code>{user['ref_code']}</code>
 
@@ -508,10 +637,13 @@ def profile_text(user_id):
 
 
 # =========================================================
-# COMMANDS
+# START
 # =========================================================
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     user = update.effective_user
 
@@ -520,7 +652,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
 
         try:
-            candidate = int(context.args[0])
+
+            candidate = int(
+                context.args[0]
+            )
 
             if candidate != user.id:
                 referred_by = candidate
@@ -534,13 +669,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await update.message.reply_text(
+
         WELCOME,
+
         parse_mode=ParseMode.HTML,
-        reply_markup=main_menu()
+
+        reply_markup=user_panel()
     )
 
 
-async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# ADMIN COMMAND
+# =========================================================
+
+async def admin(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     if update.effective_user.id != ADMIN_ID:
 
@@ -550,7 +695,12 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
+    context.user_data[
+        "awaiting_delivery"
+    ] = False
+
     await update.message.reply_text(
+
         """
 👑 <b>پنل مدیریت</b>
 
@@ -560,7 +710,9 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 یک گزینه را انتخاب کنید:
 """,
+
         parse_mode=ParseMode.HTML,
+
         reply_markup=admin_menu()
     )
 
@@ -580,7 +732,9 @@ async def callbacks(
 
     user_id = q.from_user.id
 
-    ensure_user(q.from_user)
+    ensure_user(
+        q.from_user
+    )
 
     data = q.data
 
@@ -590,10 +744,18 @@ async def callbacks(
 
     if data == "home":
 
+        context.user_data[
+            "awaiting_delivery"
+        ] = False
+
         await q.edit_message_text(
             WELCOME,
-            parse_mode=ParseMode.HTML,
-            reply_markup=main_menu()
+            parse_mode=ParseMode.HTML
+        )
+
+        await q.message.reply_text(
+            "🖥 پنل کاربری آماده است:",
+            reply_markup=user_panel()
         )
 
         return
@@ -605,8 +767,9 @@ async def callbacks(
     if data == "buy":
 
         await q.edit_message_text(
+
             """
-🛒 <b>خرید سرویس</b>
+🛒 <b>فروشگاه اشتراک‌ها</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -616,8 +779,12 @@ async def callbacks(
 🔐 سرویس اختصاصی
 📅 اعتبار ۳۰ روزه
 """,
+
             parse_mode=ParseMode.HTML,
-            reply_markup=plans_menu("plan")
+
+            reply_markup=plans_menu(
+                "plan"
+            )
         )
 
         return
@@ -628,9 +795,14 @@ async def callbacks(
 
     if data.startswith("plan:"):
 
-        plan_key = data.split(":", 1)[1]
+        plan_key = data.split(
+            ":",
+            1
+        )[1]
 
-        plan = PLANS.get(plan_key)
+        plan = PLANS.get(
+            plan_key
+        )
 
         if not plan:
             return
@@ -645,9 +817,14 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
-⚡ سرویس: <b>{plan['name']}</b>
-📦 حجم: <b>{plan['gb']} GB</b>
-⏱ اعتبار: <b>{plan['days']} روز</b>
+⚡ سرویس:
+<b>{plan['name']}</b>
+
+📦 حجم:
+<b>{plan['gb']} GB</b>
+
+⏱ اعتبار:
+<b>{plan['days']} روز</b>
 
 💰 مبلغ:
 
@@ -674,8 +851,11 @@ async def callbacks(
         ])
 
         await q.edit_message_text(
+
             text,
+
             parse_mode=ParseMode.HTML,
+
             reply_markup=keyboard
         )
 
@@ -687,7 +867,10 @@ async def callbacks(
 
     if data.startswith("pay:"):
 
-        order_id = data.split(":", 1)[1]
+        order_id = data.split(
+            ":",
+            1
+        )[1]
 
         await q.edit_message_text(
 
@@ -712,9 +895,11 @@ async def callbacks(
             parse_mode=ParseMode.HTML,
 
             reply_markup=InlineKeyboardMarkup([
+
                 [
                     back_button("buy")
                 ]
+
             ])
         )
 
@@ -726,32 +911,26 @@ async def callbacks(
 
     if data == "services":
 
-        keyboard = InlineKeyboardMarkup([
-
-            [
-                InlineKeyboardButton(
-                    "🔄 تمدید",
-                    callback_data="renew"
-                )
-            ],
-
-            [
-                InlineKeyboardButton(
-                    "🛒 خرید سرویس",
-                    callback_data="buy"
-                )
-            ],
-
-            [
-                back_button("home")
-            ],
-
-        ])
-
         await q.edit_message_text(
+
             services_text(user_id),
+
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard
+
+            reply_markup=InlineKeyboardMarkup([
+
+                [
+                    InlineKeyboardButton(
+                        "🔄 تمدید سرویس",
+                        callback_data="renew"
+                    )
+                ],
+
+                [
+                    back_button("home")
+                ]
+
+            ])
         )
 
         return
@@ -762,7 +941,9 @@ async def callbacks(
 
     if data == "renew":
 
-        services = get_services(user_id)
+        services = get_services(
+            user_id
+        )
 
         if not services:
 
@@ -781,15 +962,18 @@ async def callbacks(
                 parse_mode=ParseMode.HTML,
 
                 reply_markup=InlineKeyboardMarkup([
+
                     [
                         InlineKeyboardButton(
                             "🛒 خرید سرویس",
                             callback_data="buy"
                         )
                     ],
+
                     [
                         back_button("home")
                     ]
+
                 ])
             )
 
@@ -807,7 +991,9 @@ async def callbacks(
 
             parse_mode=ParseMode.HTML,
 
-            reply_markup=plans_menu("renewplan")
+            reply_markup=plans_menu(
+                "renewplan"
+            )
         )
 
         return
@@ -816,11 +1002,18 @@ async def callbacks(
     # RENEW PLAN
     # =====================================================
 
-    if data.startswith("renewplan:"):
+    if data.startswith(
+        "renewplan:"
+    ):
 
-        plan_key = data.split(":", 1)[1]
+        plan_key = data.split(
+            ":",
+            1
+        )[1]
 
-        plan = PLANS.get(plan_key)
+        plan = PLANS.get(
+            plan_key
+        )
 
         if not plan:
             return
@@ -837,9 +1030,14 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
-⚡ پلن: {plan['name']}
-📦 حجم: {plan['gb']} GB
-⏱ اعتبار: {plan['days']} روز
+⚡ پلن:
+{plan['name']}
+
+📦 حجم:
+{plan['gb']} GB
+
+⏱ اعتبار:
+{plan['days']} روز
 
 💰 مبلغ:
 <b>{format_price(plan['price'])}</b>
@@ -861,7 +1059,7 @@ async def callbacks(
 
                 [
                     back_button("renew")
-                ],
+                ]
 
             ])
         )
@@ -884,21 +1082,21 @@ async def callbacks(
 
                 [
                     InlineKeyboardButton(
-                        "📦 سرویس‌های من",
+                        "📡 سرویس های من",
                         callback_data="services"
                     )
                 ],
 
                 [
                     InlineKeyboardButton(
-                        "🎁 دعوت دوستان",
+                        "🎁 دعوت و دریافت رایگان",
                         callback_data="ref"
                     )
                 ],
 
                 [
                     back_button("home")
-                ],
+                ]
 
             ])
         )
@@ -911,7 +1109,9 @@ async def callbacks(
 
     if data == "ref":
 
-        bot_username = context.bot.username
+        bot_username = (
+            context.bot.username
+        )
 
         link = (
             f"https://t.me/"
@@ -922,7 +1122,7 @@ async def callbacks(
         await q.edit_message_text(
 
             f"""
-🎁 <b>دعوت دوستان</b>
+🎁 <b>دعوت و دریافت رایگان</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -932,21 +1132,23 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
-لینک را برای دوستانت ارسال کن.
+این لینک را برای دوستانت ارسال کن.
 
 هر کاربر جدیدی که از لینک تو وارد شود
 در سیستم ثبت خواهد شد.
+
+🎁 سیستم پاداش و اعتبار دعوت
+در مرحله بعد قابل فعال‌سازی است.
 """,
 
             parse_mode=ParseMode.HTML,
 
             reply_markup=InlineKeyboardMarkup([
+
                 [
-                    InlineKeyboardButton(
-                        "🔙 منوی اصلی",
-                        callback_data="home"
-                    )
+                    back_button("home")
                 ]
+
             ])
         )
 
@@ -961,33 +1163,39 @@ async def callbacks(
         await q.edit_message_text(
 
             """
-📚 <b>آموزش اتصال</b>
+📖 <b>آموزش و راهنما</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-بعد از خرید سرویس، کانفیگ از طریق ربات
-برای شما ارسال می‌شود.
+🔹 بعد از خرید سرویس، کانفیگ برایت ارسال می‌شود.
 
-🔹 کانفیگ را کپی کنید.
-🔹 آن را داخل برنامه سازگار با نوع کانفیگ وارد کنید.
-🔹 سپس اتصال را فعال کنید.
+🔹 کانفیگ را کپی کن.
 
-اگر در اتصال مشکل داشتی، از بخش
-«💬 پشتیبانی» با ما در ارتباط باش.
+🔹 آن را داخل برنامه سازگار با نوع کانفیگ وارد کن.
+
+🔹 سپس اتصال را فعال کن.
+
+━━━━━━━━━━━━━━━━━━
+
+اگر مشکلی داشتی، از بخش
+«🛟 تماس با پشتیبانی» استفاده کن.
 """,
 
             parse_mode=ParseMode.HTML,
 
             reply_markup=InlineKeyboardMarkup([
+
                 [
                     InlineKeyboardButton(
-                        "💬 پشتیبانی",
+                        "🛟 تماس با پشتیبانی",
                         callback_data="support"
                     )
                 ],
+
                 [
                     back_button("home")
                 ]
+
             ])
         )
 
@@ -1002,7 +1210,7 @@ async def callbacks(
         await q.edit_message_text(
 
             f"""
-💬 <b>پشتیبانی</b>
+🛟 <b>تماس با پشتیبانی</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1011,16 +1219,21 @@ async def callbacks(
 
 👤 {SUPPORT_USERNAME}
 
-لطفاً هنگام ارسال پیام، شماره سفارش
-یا کد سرویس را هم بفرست.
+━━━━━━━━━━━━━━━━━━
+
+هنگام ارسال پیام، اگر مربوط به
+سرویس یا سفارش خاصی است، کد سرویس
+یا شماره سفارش را هم ارسال کن.
 """,
 
             parse_mode=ParseMode.HTML,
 
             reply_markup=InlineKeyboardMarkup([
+
                 [
                     back_button("home")
                 ]
+
             ])
         )
 
@@ -1038,6 +1251,10 @@ async def callbacks(
     # =====================================================
 
     if data == "admin_home":
+
+        context.user_data[
+            "awaiting_delivery"
+        ] = False
 
         await q.edit_message_text(
 
@@ -1073,7 +1290,11 @@ async def callbacks(
         ).fetchone()["c"]
 
         active_services = con.execute(
-            "SELECT COUNT(*) c FROM services WHERE active=1"
+            """
+            SELECT COUNT(*) c
+            FROM services
+            WHERE active=1
+            """
         ).fetchone()["c"]
 
         orders = con.execute(
@@ -1081,11 +1302,19 @@ async def callbacks(
         ).fetchone()["c"]
 
         pending = con.execute(
-            "SELECT COUNT(*) c FROM orders WHERE status='pending'"
+            """
+            SELECT COUNT(*) c
+            FROM orders
+            WHERE status='pending'
+            """
         ).fetchone()["c"]
 
         paid = con.execute(
-            "SELECT COUNT(*) c FROM orders WHERE status='paid'"
+            """
+            SELECT COUNT(*) c
+            FROM orders
+            WHERE status='paid'
+            """
         ).fetchone()["c"]
 
         con.close()
@@ -1148,7 +1377,9 @@ async def callbacks(
 
         if not rows:
 
-            text = "📋 هنوز سفارشی ثبت نشده."
+            text = (
+                "📋 هنوز سفارشی ثبت نشده."
+            )
 
         else:
 
@@ -1161,23 +1392,31 @@ async def callbacks(
 
                 plan = PLANS.get(
                     row["plan_key"],
-                    {"name": row["plan_key"]}
+                    {
+                        "name":
+                        row["plan_key"]
+                    }
                 )
 
                 lines.append(
+
                     f"🧾 <b>#{row['id']}</b>\n"
                     f"👤 <code>{row['user_id']}</code>\n"
                     f"⚡ {plan['name']}\n"
                     f"💰 {format_price(row['amount'])}\n"
                     f"📌 وضعیت: {row['status']}\n"
                     f"━━━━━━━━━━━━━━━━━━"
+
                 )
 
             text = "\n".join(lines)
 
         await q.edit_message_text(
+
             text,
+
             parse_mode=ParseMode.HTML,
+
             reply_markup=admin_menu()
         )
 
@@ -1192,7 +1431,11 @@ async def callbacks(
         con = db()
 
         rows = con.execute("""
-            SELECT user_id, username, first_name, created_at
+            SELECT
+                user_id,
+                username,
+                first_name,
+                created_at
             FROM users
             ORDER BY created_at DESC
             LIMIT 15
@@ -1205,28 +1448,39 @@ async def callbacks(
         con.close()
 
         lines = [
+
             f"👥 <b>کاربران</b> — مجموع: {total}",
+
             "━━━━━━━━━━━━━━━━━━"
+
         ]
 
         for row in rows:
 
             username = (
+
                 f"@{row['username']}"
+
                 if row["username"]
+
                 else "بدون یوزرنیم"
             )
 
             lines.append(
+
                 f"👤 {row['first_name'] or 'بدون نام'}\n"
                 f"🆔 <code>{row['user_id']}</code>\n"
                 f"🔗 {username}\n"
                 f"━━━━━━━━━━━━━━━━━━"
+
             )
 
         await q.edit_message_text(
+
             "\n".join(lines),
+
             parse_mode=ParseMode.HTML,
+
             reply_markup=admin_menu()
         )
 
@@ -1260,15 +1514,21 @@ async def callbacks(
         con.close()
 
         lines = [
+
             f"📦 <b>سرویس‌ها</b> — مجموع: {total}",
+
             "━━━━━━━━━━━━━━━━━━"
+
         ]
 
         for row in rows:
 
             plan = PLANS.get(
                 row["plan_key"],
-                {"name": row["plan_key"]}
+                {
+                    "name":
+                    row["plan_key"]
+                }
             )
 
             status = (
@@ -1278,17 +1538,22 @@ async def callbacks(
             )
 
             lines.append(
+
                 f"🛰 {plan['name']}\n"
                 f"👤 <code>{row['user_id']}</code>\n"
                 f"🔑 <code>{row['code']}</code>\n"
                 f"{status}\n"
                 f"📅 {jalali_date(row['expires_at'])}\n"
                 f"━━━━━━━━━━━━━━━━━━"
+
             )
 
         await q.edit_message_text(
+
             "\n".join(lines),
+
             parse_mode=ParseMode.HTML,
+
             reply_markup=admin_menu()
         )
 
@@ -1300,7 +1565,9 @@ async def callbacks(
 
     if data == "admin_deliver":
 
-        context.user_data["awaiting_delivery"] = True
+        context.user_data[
+            "awaiting_delivery"
+        ] = True
 
         await q.edit_message_text(
 
@@ -1329,12 +1596,14 @@ async def callbacks(
             parse_mode=ParseMode.HTML,
 
             reply_markup=InlineKeyboardMarkup([
+
                 [
                     InlineKeyboardButton(
                         "🔙 پنل مدیریت",
                         callback_data="admin_home"
                     )
                 ]
+
             ])
         )
 
@@ -1342,7 +1611,7 @@ async def callbacks(
 
 
 # =========================================================
-# ADMIN DELIVERY
+# TEXT HANDLER
 # =========================================================
 
 async def text_handler(
@@ -1350,79 +1619,100 @@ async def text_handler(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    if update.effective_user.id != ADMIN_ID:
-        return
+    user_id = update.effective_user.id
 
-    if not context.user_data.get(
-        "awaiting_delivery"
+    text = update.message.text.strip()
+
+    # =====================================================
+    # ADMIN DELIVERY MODE
+    # =====================================================
+
+    if (
+        user_id == ADMIN_ID
+        and context.user_data.get(
+            "awaiting_delivery"
+        )
     ):
-        return
 
-    raw = update.message.text.strip()
+        raw = text
 
-    parts = raw.split("|", 2)
+        parts = raw.split(
+            "|",
+            2
+        )
 
-    if len(parts) != 3:
+        if len(parts) != 3:
 
-        await update.message.reply_text(
-            """
+            await update.message.reply_text(
+
+                """
 ❌ فرمت اشتباه است.
 
 فرمت صحیح:
 
 <code>USER_ID|PLAN_KEY|CONFIG</code>
+
+مثال:
+
+<code>123456789|p50|vless://...</code>
 """,
-            parse_mode=ParseMode.HTML
+
+                parse_mode=ParseMode.HTML
+            )
+
+            return
+
+        try:
+
+            target_user_id = int(
+                parts[0].strip()
+            )
+
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ USER_ID باید عدد باشد."
+            )
+
+            return
+
+        plan_key = parts[1].strip()
+
+        config = parts[2].strip()
+
+        if plan_key not in PLANS:
+
+            await update.message.reply_text(
+                "❌ PLAN_KEY نامعتبر است."
+            )
+
+            return
+
+        service_id, code = create_service(
+
+            target_user_id,
+            plan_key,
+            config
+
         )
 
-        return
+        context.user_data[
+            "awaiting_delivery"
+        ] = False
 
-    try:
-
-        user_id = int(
-            parts[0].strip()
-        )
-
-    except ValueError:
+        plan = PLANS[
+            plan_key
+        ]
 
         await update.message.reply_text(
-            "❌ USER_ID باید عدد باشد."
-        )
 
-        return
-
-    plan_key = parts[1].strip()
-    config = parts[2].strip()
-
-    if plan_key not in PLANS:
-
-        await update.message.reply_text(
-            "❌ PLAN_KEY نامعتبر است."
-        )
-
-        return
-
-    service_id, code = create_service(
-        user_id,
-        plan_key,
-        config
-    )
-
-    context.user_data[
-        "awaiting_delivery"
-    ] = False
-
-    plan = PLANS[plan_key]
-
-    await update.message.reply_text(
-
-        f"""
+            f"""
 ✅ <b>سرویس ساخته شد</b>
 
 ━━━━━━━━━━━━━━━━━━
 
 👤 کاربر:
-<code>{user_id}</code>
+<code>{target_user_id}</code>
 
 🔑 کد سرویس:
 <code>{code}</code>
@@ -1436,16 +1726,16 @@ async def text_handler(
 📨 کانفیگ برای کاربر ارسال می‌شود.
 """,
 
-        parse_mode=ParseMode.HTML
-    )
+            parse_mode=ParseMode.HTML
+        )
 
-    try:
+        try:
 
-        await context.bot.send_message(
+            await context.bot.send_message(
 
-            chat_id=user_id,
+                chat_id=target_user_id,
 
-            text=f"""
+                text=f"""
 🎉 <b>سرویس شما آماده شد</b>
 
 ━━━━━━━━━━━━━━━━━━
@@ -1471,28 +1761,228 @@ async def text_handler(
 ━━━━━━━━━━━━━━━━━━
 
 برای مشاهده سرویس‌های خودت،
-وارد بخش «📦 سرویس‌های من» شو.
+وارد بخش «📡 سرویس های من» شو.
 """,
 
-            parse_mode=ParseMode.HTML
-        )
+                parse_mode=ParseMode.HTML
+            )
 
-    except Exception as e:
+        except Exception as e:
 
-        await update.message.reply_text(
-            f"""
+            await update.message.reply_text(
+
+                f"""
 ⚠️ سرویس ساخته شد،
 اما ارسال به کاربر ناموفق بود.
 
 خطا:
+
 <code>{str(e)}</code>
 """,
-            parse_mode=ParseMode.HTML
+
+                parse_mode=ParseMode.HTML
+            )
+
+        return
+
+    # =====================================================
+    # USER PANEL
+    # =====================================================
+
+    ensure_user(
+        update.effective_user
+    )
+
+    # =====================================================
+    # PROFILE
+    # =====================================================
+
+    if text == "👤 پروفایل و کیف پول":
+
+        await update.message.reply_text(
+
+            profile_text(
+                user_id
+            ),
+
+            parse_mode=ParseMode.HTML,
+
+            reply_markup=user_panel()
         )
+
+        return
+
+    # =====================================================
+    # STORE
+    # =====================================================
+
+    if text == "🛒 فروشگاه اشتراک‌ها":
+
+        await update.message.reply_text(
+
+            """
+🛒 <b>فروشگاه اشتراک‌ها</b>
+
+━━━━━━━━━━━━━━━━━━
+
+پلن موردنظر خودت را انتخاب کن:
+""",
+
+            parse_mode=ParseMode.HTML,
+
+            reply_markup=plans_menu(
+                "plan"
+            )
+        )
+
+        return
+
+    # =====================================================
+    # SERVICES
+    # =====================================================
+
+    if text == "📡 سرویس های من":
+
+        await update.message.reply_text(
+
+            services_text(
+                user_id
+            ),
+
+            parse_mode=ParseMode.HTML,
+
+            reply_markup=InlineKeyboardMarkup([
+
+                [
+                    InlineKeyboardButton(
+                        "🔄 تمدید سرویس",
+                        callback_data="renew"
+                    )
+                ],
+
+                [
+                    back_button("home")
+                ]
+
+            ])
+        )
+
+        return
+
+    # =====================================================
+    # REFERRAL
+    # =====================================================
+
+    if text == "🎁 دعوت و دریافت رایگان":
+
+        bot_username = (
+            context.bot.username
+        )
+
+        link = (
+            f"https://t.me/"
+            f"{bot_username}"
+            f"?start={user_id}"
+        )
+
+        await update.message.reply_text(
+
+            f"""
+🎁 <b>دعوت و دریافت رایگان</b>
+
+━━━━━━━━━━━━━━━━━━
+
+لینک اختصاصی شما:
+
+<code>{link}</code>
+
+━━━━━━━━━━━━━━━━━━
+
+این لینک را برای دوستانت ارسال کن.
+
+هر کاربر جدیدی که از لینک تو وارد شود
+در سیستم ثبت خواهد شد.
+
+🎁 سیستم پاداش و اعتبار دعوت
+در مرحله بعد قابل فعال‌سازی است.
+""",
+
+            parse_mode=ParseMode.HTML,
+
+            reply_markup=user_panel()
+        )
+
+        return
+
+    # =====================================================
+    # GUIDE
+    # =====================================================
+
+    if text == "📖 آموزش و راهنما":
+
+        await update.message.reply_text(
+
+            """
+📖 <b>آموزش و راهنما</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🔹 بعد از خرید سرویس، کانفیگ برایت ارسال می‌شود.
+
+🔹 کانفیگ را کپی کن.
+
+🔹 آن را داخل برنامه سازگار با نوع کانفیگ وارد کن.
+
+🔹 سپس اتصال را فعال کن.
+
+━━━━━━━━━━━━━━━━━━
+
+اگر مشکلی داشتی، از بخش
+«🛟 تماس با پشتیبانی» استفاده کن.
+""",
+
+            parse_mode=ParseMode.HTML,
+
+            reply_markup=user_panel()
+        )
+
+        return
+
+    # =====================================================
+    # SUPPORT
+    # =====================================================
+
+    if text == "🛟 تماس با پشتیبانی":
+
+        await update.message.reply_text(
+
+            f"""
+🛟 <b>تماس با پشتیبانی</b>
+
+━━━━━━━━━━━━━━━━━━
+
+اگر در خرید یا سرویس مشکلی داری،
+با پشتیبانی در ارتباط باش:
+
+👤 {SUPPORT_USERNAME}
+
+━━━━━━━━━━━━━━━━━━
+
+هنگام ارسال پیام، اگر مربوط به
+سرویس یا سفارش خاصی است، کد سرویس
+یا شماره سفارش را هم ارسال کن.
+""",
+
+            parse_mode=ParseMode.HTML,
+
+            reply_markup=user_panel()
+        )
+
+        return
 
 
 # =========================================================
-# ERROR
+# ERROR HANDLER
 # =========================================================
 
 async def error_handler(
