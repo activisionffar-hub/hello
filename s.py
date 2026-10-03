@@ -151,7 +151,8 @@ def init_db():
             used_gb REAL DEFAULT 0,
             expires_at TEXT NOT NULL,
             purchased_at TEXT NOT NULL,
-            active INTEGER DEFAULT 1
+            active INTEGER DEFAULT 1,
+            config_name TEXT
         )
     """)
 
@@ -162,9 +163,13 @@ def init_db():
             plan_key TEXT NOT NULL,
             amount INTEGER NOT NULL,
             status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            config_name TEXT
         )
     """)
+
+    ensure_column(con, "services", "config_name", "TEXT")
+    ensure_column(con, "orders", "config_name", "TEXT")
 
     # رسیدهای مربوط به خرید/سفارش
     cur.execute("""
@@ -357,7 +362,34 @@ def create_order(user_id, plan_key):
     return order_id
 
 
-def create_service(user_id, plan_key, config):
+def set_order_config_name(order_id, user_id, config_name):
+    name = (config_name or "").strip()[:40]
+    if not name:
+        return False
+    con = db()
+    cur = con.execute(
+        "UPDATE orders SET config_name=? WHERE id=? AND user_id=?",
+        (name, order_id, user_id)
+    )
+    con.commit()
+    con.close()
+    return cur.rowcount == 1
+
+
+def get_order_config_name(user_id, plan_key):
+    con = db()
+    row = con.execute(
+        """SELECT config_name FROM orders
+           WHERE user_id=? AND plan_key=? AND status='paid'
+             AND config_name IS NOT NULL AND TRIM(config_name) != ''
+           ORDER BY id DESC LIMIT 1""",
+        (user_id, plan_key)
+    ).fetchone()
+    con.close()
+    return row["config_name"] if row else None
+
+
+def create_service(user_id, plan_key, config, config_name=None):
     plan = PLANS[plan_key]
     now = datetime.now()
     expires = now + timedelta(days=plan["days"])
@@ -383,9 +415,10 @@ def create_service(user_id, plan_key, config):
             config,
             total_gb,
             expires_at,
-            purchased_at
+            purchased_at,
+            config_name
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         user_id,
         code,
@@ -394,6 +427,7 @@ def create_service(user_id, plan_key, config):
         plan["gb"],
         expires.isoformat(timespec="seconds"),
         now.isoformat(timespec="seconds"),
+        config_name,
     ))
 
     service_id = cur.lastrowid
@@ -937,6 +971,23 @@ def user_panel():
     )
 
 
+async def user_reply(update, context, *args, **kwargs):
+    """پیام قبلی پنل کاربر را قبل از نمایش پیام جدید حذف می‌کند."""
+    old_id = context.user_data.get("last_user_panel_message_id")
+    if old_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=old_id
+            )
+        except Exception:
+            pass
+
+    message = await update.message.reply_text(*args, **kwargs)
+    context.user_data["last_user_panel_message_id"] = message.message_id
+    return message
+
+
 # =========================================================
 # INLINE PLANS
 # =========================================================
@@ -1069,6 +1120,7 @@ def services_text(user_id):
 
         lines.extend([
             f"🛰 <b>{plan['name']}</b>",
+            f"🏷 نام کانفیگ: <b>{escape(str(service['config_name'] or plan['name']))}</b>",
             f"🔑 کد سرویس: "
             f"<code>{escape(str(service['code']))}</code>",
             f"📊 وضعیت: {status}",
@@ -1128,6 +1180,7 @@ def profile_text(user_id):
 
             subscription_lines.extend([
                 f"📦 <b>نوع اشتراک:</b> {escape(str(plan['name']))}",
+                f"🏷 <b>نام کانفیگ:</b> {escape(str(service['config_name'] or plan['name']))}",
                 f"📊 <b>حجم کانفیگ:</b> {service['total_gb']} GB",
                 f"⏱ <b>مدت از زمان خرید:</b> {elapsed_days} روز",
                 f"🛒 <b>تاریخ خرید:</b> {jalali_date(service['purchased_at'])}",
@@ -1171,7 +1224,7 @@ def card_payment_text(title, amount, extra=""):
 💳 <b>اطلاعات پرداخت</b>
 
 🏦 <b>شماره کارت:</b> <code>{escape(CARD_NUMBER)}</code>
-👤 <b>به نام:</b> <b>{escape(CARD_HOLDER)}</b>
+👤 <b>به نام: {escape(CARD_HOLDER)}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1226,7 +1279,31 @@ async def start(
     is_new_user = ensure_user(user, referred_by)
 
     if is_new_user and referred_by:
-        add_referral_reward(referred_by, user.id)
+        rewarded = add_referral_reward(referred_by, user.id)
+        if rewarded:
+            new_username = (
+                f"@{user.username}"
+                if user.username
+                else "ندارد"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=referred_by,
+                    text=f"""🎉 <b>دعوت جدید!</b>
+
+━━━━━━━━━━━━━━━━━━
+
+👤 کاربر جدید: <b>{escape(user.first_name or '—')}</b>
+🔗 یوزرنیم: <b>{escape(new_username)}</b>
+
+🎁 <b>پاداش شما: 3 GB</b>
+📦 موجودی پاداش دعوت: <b>{get_user(referred_by)['referral_gb_balance'] or 0} GB</b>
+
+یک کاربر جدید با لینک دعوتت وارد ربات شد.""",
+                    parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
 
     # ادمین پنل مشتری نبیند
     if user.id == ADMIN_ID:
@@ -1383,9 +1460,6 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
-⚡ سرویس:
-<b>{plan['name']}</b>
-
 📦 حجم:
 <b>{plan['gb']} GB</b>
 
@@ -1466,6 +1540,8 @@ async def callbacks(
 
         plan = PLANS.get(order["plan_key"], {"name": order["plan_key"], "gb": 0, "days": 0})
 
+        context.user_data["awaiting_config_name_order_id"] = order_id
+
         await q.edit_message_text(
             f"""
 ✅ <b>پرداخت با کیف پول موفق بود</b>
@@ -1483,6 +1559,11 @@ async def callbacks(
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[back_button("home")]])
+        )
+
+        await q.message.reply_text(
+            "🏷 <b>یک نام برای کانفیگت انتخاب کن</b>\n\nمثلاً: <code>آریا</code> یا <code>گوشی من</code>\n\nاین نام در «📡 سرویس های من» و پیام‌های مربوط به کانفیگ نمایش داده می‌شود.",
+            parse_mode=ParseMode.HTML
         )
 
         try:
@@ -1534,7 +1615,10 @@ async def callbacks(
                 order["amount"]
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=order_payment_keyboard(order_id, include_wallet=(order["status"] in ("pending", "rejected")))
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 ارسال رسید", callback_data=f"receipt:{order_id}")],
+                [back_button("buy")]
+            ])
         )
         return
 
@@ -1621,11 +1705,8 @@ async def callbacks(
 💰 مبلغ موردنظر برای شارژ کیف پول را به تومان وارد کن.
 
 مثال:
-<code>50,000 تومان</code>
 
-━━━━━━━━━━━━━━━━━━
-
-              <b>50,000 تومان</b>
+<b>50,000 تومان</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1712,6 +1793,7 @@ async def callbacks(
 ━━━━━━━━━━━━━━━━━━
 
 🛰 <b>{escape(str(plan['name']))}</b>
+🏷 نام کانفیگ: <b>{escape(str(service['config_name'] or plan['name']))}</b>
 🔑 کد سرویس: <code>{escape(str(service['code']))}</code>
 
 🔐 <b>کانفیگ</b>
@@ -1732,7 +1814,7 @@ async def callbacks(
             for service in services:
                 rows.append([
                     InlineKeyboardButton(
-                        f"📤 ارسال دوباره کانفیگ {service['code']}",
+                        f"📤 {service['config_name'] or service['code']}",
                         callback_data=f"resend_config:{service['id']}"
                     )
                 ])
@@ -2739,6 +2821,7 @@ async def photo_handler(
         )
 
         context.user_data["awaiting_receipt_order_id"] = None
+        context.user_data["awaiting_config_name_order_id"] = order_id
 
         await update.message.reply_text(
             f"""
@@ -2754,7 +2837,10 @@ async def photo_handler(
 
 ⏳ رسید برای بررسی ادمین ارسال شد.
 
-بعد از تأیید، مبلغ پرداختی به کیف پولت اضافه می‌شود.
+🏷 <b>حالا یک نام برای کانفیگت انتخاب کن:</b>
+مثلاً <code>آریا</code> یا <code>گوشی من</code>
+
+این نام بعداً در پیام‌ها و بخش «📡 سرویس های من» نمایش داده می‌شود.
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=user_panel()
@@ -3015,10 +3101,13 @@ async def text_handler(
             )
             return
 
+        config_name = get_order_config_name(target_user_id, plan_key) or PLANS[plan_key]["name"]
+
         service_id, code = create_service(
             target_user_id,
             plan_key,
-            config
+            config,
+            config_name=config_name
         )
 
         context.user_data["awaiting_delivery"] = False
@@ -3056,6 +3145,7 @@ async def text_handler(
 ━━━━━━━━━━━━━━━━━━
 
 🛰 <b>{plan['name']}</b>  •  📦 <b>{plan['gb']} GB</b>  •  ⏱ <b>{plan['days']} روز</b>
+🏷 نام کانفیگ: <b>{escape(str(config_name))}</b>
 🔑 کد سرویس: <code>{code}</code>
 
 🔐 <b>کانفیگ</b>
@@ -3092,6 +3182,63 @@ async def text_handler(
     ensure_user(update.effective_user)
 
     # =====================================================
+    # CONFIG NAME INPUT
+    # =====================================================
+
+    if context.user_data.get("awaiting_config_name_order_id"):
+        order_id = context.user_data.get("awaiting_config_name_order_id")
+        config_name = text.strip()
+
+        if len(config_name) < 2:
+            await user_reply(update, context, "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.")
+            return
+
+        if len(config_name) > 40:
+            await user_reply(update, context, "❌ نام کانفیگ حداکثر ۴۰ کاراکتر باشد.")
+            return
+
+        if not set_order_config_name(order_id, user_id, config_name):
+            context.user_data["awaiting_config_name_order_id"] = None
+            await user_reply(update, context, "❌ سفارش پیدا نشد. لطفاً با پشتیبانی تماس بگیر.")
+            return
+
+        con = db()
+        order_row = con.execute(
+            "SELECT plan_key, created_at FROM orders WHERE id=? AND user_id=?",
+            (order_id, user_id)
+        ).fetchone()
+        if order_row:
+            con.execute(
+                """UPDATE services SET config_name=?
+                   WHERE id=(SELECT id FROM services
+                             WHERE user_id=? AND plan_key=?
+                               AND purchased_at >= ?
+                             ORDER BY id DESC LIMIT 1)""",
+                (config_name, user_id, order_row["plan_key"], order_row["created_at"])
+            )
+            con.commit()
+        con.close()
+
+        context.user_data["awaiting_config_name_order_id"] = None
+        await user_reply(
+            update,
+            context,
+            f"🏷 <b>نام کانفیگ ثبت شد</b>\n\nنام انتخابی: <b>{escape(config_name)}</b>\n\nپس از تحویل سرویس، همین نام کنار کانفیگت نمایش داده می‌شود.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🏷 <b>نام کانفیگ کاربر ثبت شد</b>\n\n🧾 سفارش: <code>#{order_id}</code>\n👤 کاربر: <code>{user_id}</code>\n🔗 یوزرنیم: <b>{escape('@' + update.effective_user.username if update.effective_user.username else 'ندارد')}</b>\n🏷 نام کانفیگ: <b>{escape(config_name)}</b>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # =====================================================
     # WALLET AMOUNT INPUT
     # =====================================================
 
@@ -3104,7 +3251,7 @@ async def text_handler(
         )
 
         if not normalized.isdigit():
-            await update.message.reply_text(
+            await user_reply(update, context, 
                 """
 ❌ مبلغ نامعتبر است.
 
@@ -3120,13 +3267,13 @@ async def text_handler(
         amount = int(normalized)
 
         if amount < 1000:
-            await update.message.reply_text(
+            await user_reply(update, context, 
                 "❌ حداقل مبلغ شارژ 1,000 تومان است."
             )
             return
 
         if amount > 1_000_000_000:
-            await update.message.reply_text(
+            await user_reply(update, context, 
                 "❌ مبلغ واردشده بیش از حد مجاز است."
             )
             return
@@ -3134,7 +3281,7 @@ async def text_handler(
         if has_pending_wallet_deposit(user_id):
             context.user_data["awaiting_wallet_amount"] = False
 
-            await update.message.reply_text(
+            await user_reply(update, context, 
                 """
 ⏳ یک درخواست شارژ قبلی هنوز در انتظار بررسی ادمین است.
 
@@ -3147,7 +3294,7 @@ async def text_handler(
         context.user_data["awaiting_wallet_amount"] = False
         context.user_data["wallet_amount"] = amount
 
-        await update.message.reply_text(
+        await user_reply(update, context, 
             card_payment_text(
                 "شارژ کیف پول",
                 amount,
@@ -3175,7 +3322,7 @@ async def text_handler(
     # =====================================================
 
     if text == "👤 پروفایل و کیف پول":
-        await update.message.reply_text(
+        await user_reply(update, context, 
             profile_text(user_id),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -3213,7 +3360,7 @@ async def text_handler(
         context.user_data["wallet_amount"] = None
         context.user_data["awaiting_receipt_order_id"] = None
 
-        await update.message.reply_text(
+        await user_reply(update, context, 
             """
 <b>✦ Kaletek</b>
 
@@ -3223,7 +3370,8 @@ async def text_handler(
 💰 مبلغ موردنظر برای شارژ کیف پول را به تومان وارد کن.
 
 مثال:
-<code>50,000 تومان</code>
+
+<b>50,000 تومان</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -3242,7 +3390,7 @@ async def text_handler(
     # =====================================================
 
     if text == "🛒 فروشگاه اشتراک‌ها":
-        await update.message.reply_text(
+        await user_reply(update, context, 
             """
 🛒 <b>فروشگاه اشتراک‌ها</b>
 
@@ -3266,7 +3414,7 @@ async def text_handler(
             for service in services:
                 rows.append([
                     InlineKeyboardButton(
-                        f"📤 ارسال دوباره کانفیگ {service['code']}",
+                        f"📤 {service['config_name'] or service['code']}",
                         callback_data=f"resend_config:{service['id']}"
                     )
                 ])
@@ -3285,7 +3433,7 @@ async def text_handler(
             ])
         rows.append([back_button("home")])
 
-        await update.message.reply_text(
+        await user_reply(update, context, 
             services_text(user_id),
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(rows)
@@ -3305,7 +3453,7 @@ async def text_handler(
             f"?start={user_id}"
         )
 
-        await update.message.reply_text(
+        await user_reply(update, context, 
             f"""
 🎁 <b>دعوت و دریافت رایگان</b>
 
@@ -3336,7 +3484,7 @@ async def text_handler(
     # =====================================================
 
     if text == "📖 آموزش و راهنما":
-        await update.message.reply_text(
+        await user_reply(update, context, 
             """
 📚 <b>راهنمای استفاده از سرویس</b>
 
@@ -3349,13 +3497,17 @@ async def text_handler(
 💰 <b>۲. شارژ کیف پول</b>
 از «پروفایل و کیف پول» مبلغ دلخواهت را وارد کن، واریز را انجام بده و تصویر رسید را ارسال کن. پس از تأیید ادمین، مبلغ به موجودی کیف پول اضافه می‌شود.
 
-📡 <b>۳. دریافت کانفیگ</b>
+🎁 <b>۳. دعوت و دریافت رایگان</b>
+لینک دعوت اختصاصی خودت را از بخش «🎁 دعوت و دریافت رایگان» بردار و برای دوستانت بفرست.
+به ازای هر کاربر جدیدی که با لینک تو وارد ربات شود، <b>3 GB</b> پاداش رایگان برایت ثبت می‌شود.
+
+📡 <b>۴. دریافت کانفیگ</b>
 بعد از تأیید پرداخت و تحویل سرویس توسط ادمین، کانفیگ برایت ارسال می‌شود و در «سرویس های من» هم قابل مشاهده است.
 
-🔄 <b>۴. تمدید</b>
+🔄 <b>۵. تمدید</b>
 اگر سرویس فعال داشته باشی، از بخش «سرویس های من» می‌توانی آن را تمدید کنی و هزینه را از کیف پول پرداخت کنی یا رسید ارسال کنی.
 
-🔐 <b>۵. اتصال</b>
+🔐 <b>۶. اتصال</b>
 کانفیگ را کپی کن و داخل برنامه سازگار با نوع کانفیگ وارد کن، سپس اتصال را فعال کن.
 
 🛟 <b>مشکل داشتی؟</b>
@@ -3385,7 +3537,397 @@ async def text_handler(
             except Exception:
                 pass
 
-        await update.message.reply_text(
+        await user_reply(update, context, 
+            """
+🛟 <b>تماس با پشتیبانی</b>
+
+━━━━━━━━━━━━━━━━━━
+
+اگر در خرید یا سرویس مشکلی داری،
+از دکمه زیر با پشتیبانی تماس بگیر.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💬 تماس با پشتیبانی",
+                        url=(
+                            "https://t.me/"
+                            + SUPPORT_USERNAME.lstrip("@")
+                        )
+                    )
+                ]
+            ])
+        )
+        return
+
+
+    # =====================================================
+    # ADMIN SHOULD NOT USE USER PANEL
+    # =====================================================
+
+    if user_id == ADMIN_ID:
+        return
+
+    ensure_user(update.effective_user)
+
+    # =====================================================
+    # CONFIG NAME INPUT
+    # =====================================================
+
+    if context.user_data.get("awaiting_config_name_order_id"):
+        order_id = context.user_data.get("awaiting_config_name_order_id")
+        config_name = text.strip()
+
+        if len(config_name) < 2:
+            await user_reply(update, context, "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.")
+            return
+
+        if len(config_name) > 40:
+            await user_reply(update, context, "❌ نام کانفیگ حداکثر ۴۰ کاراکتر باشد.")
+            return
+
+        if not set_order_config_name(order_id, user_id, config_name):
+            context.user_data["awaiting_config_name_order_id"] = None
+            await user_reply(update, context, "❌ سفارش پیدا نشد. لطفاً با پشتیبانی تماس بگیر.")
+            return
+
+        con = db()
+        order_row = con.execute(
+            "SELECT plan_key, created_at FROM orders WHERE id=? AND user_id=?",
+            (order_id, user_id)
+        ).fetchone()
+        if order_row:
+            con.execute(
+                """UPDATE services SET config_name=?
+                   WHERE id=(SELECT id FROM services
+                             WHERE user_id=? AND plan_key=?
+                               AND purchased_at >= ?
+                             ORDER BY id DESC LIMIT 1)""",
+                (config_name, user_id, order_row["plan_key"], order_row["created_at"])
+            )
+            con.commit()
+        con.close()
+
+        context.user_data["awaiting_config_name_order_id"] = None
+        await user_reply(
+            update,
+            context,
+            f"🏷 <b>نام کانفیگ ثبت شد</b>\n\nنام انتخابی: <b>{escape(config_name)}</b>\n\nپس از تحویل سرویس، همین نام کنار کانفیگت نمایش داده می‌شود.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"🏷 <b>نام کانفیگ کاربر ثبت شد</b>\n\n🧾 سفارش: <code>#{order_id}</code>\n👤 کاربر: <code>{user_id}</code>\n🔗 یوزرنیم: <b>{escape('@' + update.effective_user.username if update.effective_user.username else 'ندارد')}</b>\n🏷 نام کانفیگ: <b>{escape(config_name)}</b>",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # =====================================================
+    # WALLET AMOUNT INPUT
+    # =====================================================
+
+    if context.user_data.get("awaiting_wallet_amount"):
+        normalized = (
+            text
+            .replace(",", "")
+            .replace("تومان", "")
+            .replace(" ", "")
+        )
+
+        if not normalized.isdigit():
+            await user_reply(update, context, 
+                """
+❌ مبلغ نامعتبر است.
+
+لطفاً فقط عدد وارد کن.
+
+مثال:
+<code>50,000 تومان</code>
+""",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        amount = int(normalized)
+
+        if amount < 1000:
+            await user_reply(update, context, 
+                "❌ حداقل مبلغ شارژ 1,000 تومان است."
+            )
+            return
+
+        if amount > 1_000_000_000:
+            await user_reply(update, context, 
+                "❌ مبلغ واردشده بیش از حد مجاز است."
+            )
+            return
+
+        if has_pending_wallet_deposit(user_id):
+            context.user_data["awaiting_wallet_amount"] = False
+
+            await user_reply(update, context, 
+                """
+⏳ یک درخواست شارژ قبلی هنوز در انتظار بررسی ادمین است.
+
+لطفاً تا تعیین تکلیف درخواست قبلی صبر کن.
+""",
+                reply_markup=user_panel()
+            )
+            return
+
+        context.user_data["awaiting_wallet_amount"] = False
+        context.user_data["wallet_amount"] = amount
+
+        await user_reply(update, context, 
+            card_payment_text(
+                "شارژ کیف پول",
+                amount,
+                extra=(
+                    "💰 مبلغی که وارد کردی ثبت شد."
+                )
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "📤 ارسال رسید",
+                        callback_data="wallet_send_receipt"
+                    )
+                ],
+                [
+                    back_button("profile")
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # PROFILE
+    # =====================================================
+
+    if text == "👤 پروفایل و کیف پول":
+        await user_reply(update, context, 
+            profile_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "💰 شارژ کیف پول",
+                        callback_data="wallet_topup"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📡 سرویس های من",
+                        callback_data="services"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🎁 دعوت و دریافت رایگان",
+                        callback_data="ref"
+                    )
+                ],
+                [
+                    back_button("home")
+                ]
+            ])
+        )
+        return
+
+    # =====================================================
+    # DIRECT WALLET TOP-UP BUTTON
+    # =====================================================
+
+    if text == "💰 شارژ کیف پول":
+        context.user_data["awaiting_wallet_amount"] = True
+        context.user_data["wallet_amount"] = None
+        context.user_data["awaiting_receipt_order_id"] = None
+
+        await user_reply(update, context, 
+            """
+<b>✦ Kaletek</b>
+
+💳 <b>شارژ کیف پول</b>
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ موردنظر برای شارژ کیف پول را به تومان وارد کن.
+
+مثال:
+
+<b>50,000 تومان</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🔹 مبلغ را با عدد وارد کن.
+🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [back_button("profile")]
+            ])
+        )
+        return
+
+    # =====================================================
+    # STORE
+    # =====================================================
+
+    if text == "🛒 فروشگاه اشتراک‌ها":
+        await user_reply(update, context, 
+            """
+🛒 <b>فروشگاه اشتراک‌ها</b>
+
+━━━━━━━━━━━━━━━━━━
+
+پلن موردنظر خودت را انتخاب کن:
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=plans_menu("plan")
+        )
+        return
+
+    # =====================================================
+    # SERVICES
+    # =====================================================
+
+    if text == "📡 سرویس های من":
+        services = get_services(user_id)
+        rows = []
+        if services:
+            for service in services:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"📤 {service['config_name'] or service['code']}",
+                        callback_data=f"resend_config:{service['id']}"
+                    )
+                ])
+            rows.append([
+                InlineKeyboardButton(
+                    "🔄 تمدید سرویس",
+                    callback_data="renew"
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    "🛒 خرید سرویس",
+                    callback_data="buy"
+                )
+            ])
+        rows.append([back_button("home")])
+
+        await user_reply(update, context, 
+            services_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    # =====================================================
+    # REFERRAL
+    # =====================================================
+
+    if text == "🎁 دعوت و دریافت رایگان":
+        bot_username = context.bot.username
+
+        link = (
+            f"https://t.me/"
+            f"{bot_username}"
+            f"?start={user_id}"
+        )
+
+        await user_reply(update, context, 
+            f"""
+🎁 <b>دعوت و دریافت رایگان</b>
+
+━━━━━━━━━━━━━━━━━━
+
+لینک اختصاصی شما:
+
+<code>{escape(link)}</code>
+
+━━━━━━━━━━━━━━━━━━
+
+این لینک را برای دوستانت ارسال کن.
+
+هر کاربر جدیدی که با لینک تو وارد شود، ثبت می‌شود.
+
+🎁 <b>پاداش دعوت</b>
+به ازای هر دعوت موفق، <b>3 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
+
+📦 موجودی پاداش فعلی: <b>{get_user(user_id)['referral_gb_balance'] or 0} GB</b>
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+        return
+
+    # =====================================================
+    # GUIDE
+    # =====================================================
+
+    if text == "📖 آموزش و راهنما":
+        await user_reply(update, context, 
+            """
+📚 <b>راهنمای استفاده از سرویس</b>
+
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+
+🛒 <b>۱. خرید سرویس</b>
+از بخش «فروشگاه اشتراک‌ها» پلن موردنظرت را انتخاب کن.
+می‌توانی هزینه را از کیف پول پرداخت کنی یا با کارت و ارسال رسید پرداخت کنی.
+
+💰 <b>۲. شارژ کیف پول</b>
+از «پروفایل و کیف پول» مبلغ دلخواهت را وارد کن، واریز را انجام بده و تصویر رسید را ارسال کن. پس از تأیید ادمین، مبلغ به موجودی کیف پول اضافه می‌شود.
+
+🎁 <b>۳. دعوت و دریافت رایگان</b>
+لینک دعوت اختصاصی خودت را از بخش «🎁 دعوت و دریافت رایگان» بردار و برای دوستانت بفرست.
+به ازای هر کاربر جدیدی که با لینک تو وارد ربات شود، <b>3 GB</b> پاداش رایگان برایت ثبت می‌شود.
+
+📡 <b>۴. دریافت کانفیگ</b>
+بعد از تأیید پرداخت و تحویل سرویس توسط ادمین، کانفیگ برایت ارسال می‌شود و در «سرویس های من» هم قابل مشاهده است.
+
+🔄 <b>۵. تمدید</b>
+اگر سرویس فعال داشته باشی، از بخش «سرویس های من» می‌توانی آن را تمدید کنی و هزینه را از کیف پول پرداخت کنی یا رسید ارسال کنی.
+
+🔐 <b>۶. اتصال</b>
+کانفیگ را کپی کن و داخل برنامه سازگار با نوع کانفیگ وارد کن، سپس اتصال را فعال کن.
+
+🛟 <b>مشکل داشتی؟</b>
+از بخش «تماس با پشتیبانی» با پشتیبانی در ارتباط باش.
+
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+✨ <b>اگر در هر مرحله مشکلی داشتی، شماره سفارش یا کد سرویس را همراه پیامت ارسال کن.</b>
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+        return
+
+    # =====================================================
+    # SUPPORT
+    # =====================================================
+
+    if text == "🛟 تماس با پشتیبانی":
+        if (
+            SUPPORT_STICKER_ID
+            and SUPPORT_STICKER_ID != "PASTE_STICKER_FILE_ID_HERE"
+        ):
+            try:
+                await update.message.reply_sticker(
+                    SUPPORT_STICKER_ID
+                )
+            except Exception:
+                pass
+
+        await user_reply(update, context, 
             """
 🛟 <b>تماس با پشتیبانی</b>
 
