@@ -336,12 +336,12 @@ def add_referral_reward(inviter_id, invited_user_id):
         cur.execute("""
             INSERT OR IGNORE INTO referral_rewards
             (inviter_id, invited_user_id, reward_gb, created_at)
-            VALUES (?, ?, 3, ?)
+            VALUES (?, ?, 1, ?)
         """, (inviter_id, invited_user_id, datetime.now().isoformat(timespec="seconds")))
 
         if cur.rowcount == 1:
             cur.execute(
-                "UPDATE users SET referral_gb_balance = COALESCE(referral_gb_balance, 0) + 3 WHERE user_id=?",
+                "UPDATE users SET referral_gb_balance = COALESCE(referral_gb_balance, 0) + 1 WHERE user_id=?",
                 (inviter_id,)
             )
             con.commit()
@@ -1376,7 +1376,7 @@ async def start(
 👤 کاربر جدید: <b>{escape(user.first_name or '—')}</b>
 🔗 یوزرنیم: <b>{escape(new_username)}</b>
 
-🎁 <b>پاداش شما: 3 GB</b>
+🎁 <b>پاداش شما: 1 GB</b>
 📦 موجودی پاداش دعوت: <b>{get_user(referred_by)['referral_gb_balance'] or 0} GB</b>
 
 یک کاربر جدید با لینک دعوتت وارد ربات شد.""",
@@ -2211,12 +2211,6 @@ async def callbacks(
                     )
                 ],
                 [
-                    InlineKeyboardButton(
-                        "🎁 دعوت و دریافت رایگان",
-                        callback_data="ref"
-                    )
-                ],
-                [
                     back_button("home")
                 ]
             ])
@@ -2253,7 +2247,7 @@ async def callbacks(
 هر کاربر جدیدی که با لینک تو وارد شود، ثبت می‌شود.
 
 🎁 <b>پاداش دعوت</b>
-به ازای هر دعوت موفق، <b>3 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
+به ازای هر دعوت موفق، <b>1 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
 
 📦 موجودی پاداش فعلی: <b>{get_user(user_id)['referral_gb_balance'] or 0} GB</b>
 """,
@@ -3538,16 +3532,24 @@ async def text_handler(
             pass
         return
 
-    # هنگام ارسال رسید: متن و هر پیام غیرعکس خطا می‌دهد،
-    # اما دکمه‌های پنل باید بدون خطا وارد مسیر عادی خودشان شوند.
+    # هنگام ارسال رسید:
+    # - اگر کاربر دکمه پنل را بزند، از مرحله رسید خارج می‌شویم و
+    #   همان دکمه پنل عادی اجرا می‌شود.
+    # - هر متن دیگری در این مرحله خطا می‌گیرد و کاربر همچنان منتظر عکس می‌ماند.
     if (context.user_data.get("awaiting_receipt_order_id") or
-            context.user_data.get("awaiting_wallet_receipt")) and text not in panel_buttons:
-        await user_reply(
-            update, context,
-            "❌ در این مرحله فقط <b>عکس رسید پرداخت</b> را ارسال کن.",
-            parse_mode=ParseMode.HTML
-        )
-        return
+            context.user_data.get("awaiting_wallet_receipt")):
+        if text in panel_buttons:
+            context.user_data["awaiting_receipt_order_id"] = None
+            context.user_data["awaiting_wallet_receipt"] = False
+            context.user_data["wallet_amount"] = None
+            context.user_data["awaiting_wallet_amount"] = False
+        else:
+            await user_reply(
+                update, context,
+                "❌ در این مرحله فقط <b>عکس رسید پرداخت</b> را ارسال کن.",
+                parse_mode=ParseMode.HTML
+            )
+            return
 
     # =====================================================
     # CUSTOM DIRECT VOLUME INPUT
@@ -3702,12 +3704,6 @@ async def text_handler(
                     )
                 ],
                 [
-                    InlineKeyboardButton(
-                        "🎁 دعوت و دریافت رایگان",
-                        callback_data="ref"
-                    )
-                ],
-                [
                     back_button("home")
                 ]
             ])
@@ -3719,9 +3715,10 @@ async def text_handler(
     # =====================================================
 
     if text == "💰 شارژ کیف پول":
-        context.user_data["awaiting_wallet_amount"] = True
+        context.user_data["awaiting_wallet_amount"] = False
         context.user_data["wallet_amount"] = None
         context.user_data["awaiting_receipt_order_id"] = None
+        context.user_data["awaiting_wallet_receipt"] = False
 
         await user_reply(update, context, 
             """
@@ -3738,11 +3735,12 @@ async def text_handler(
 
 ━━━━━━━━━━━━━━━━━━
 
-🔹 مبلغ را با عدد وارد کن.
+🔹 برای وارد کردن مبلغ، روی «▶️ ادامه» بزن.
 🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("▶️ ادامه", callback_data="wallet_topup_continue")],
                 [back_button("profile")]
             ])
         )
@@ -3835,7 +3833,7 @@ async def text_handler(
 هر کاربر جدیدی که با لینک تو وارد شود، ثبت می‌شود.
 
 🎁 <b>پاداش دعوت</b>
-به ازای هر دعوت موفق، <b>3 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
+به ازای هر دعوت موفق، <b>1 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
 
 📦 موجودی پاداش فعلی: <b>{get_user(user_id)['referral_gb_balance'] or 0} GB</b>
 """,
@@ -3864,7 +3862,7 @@ async def text_handler(
 
 🎁 <b>۳. دعوت و دریافت رایگان</b>
 لینک دعوت اختصاصی خودت را از بخش «🎁 دعوت و دریافت رایگان» بردار و برای دوستانت بفرست.
-به ازای هر کاربر جدیدی که با لینک تو وارد ربات شود، <b>3 GB</b> پاداش رایگان برایت ثبت می‌شود.
+به ازای هر کاربر جدیدی که با لینک تو وارد ربات شود، <b>1 GB</b> پاداش رایگان 1 GB برایت ثبت می‌شود.
 
 📡 <b>۴. دریافت کانفیگ</b>
 بعد از تأیید پرداخت و تحویل سرویس توسط ادمین، کانفیگ برایت ارسال می‌شود و در «سرویس های من» هم قابل مشاهده است.
@@ -4037,12 +4035,6 @@ async def text_handler(
                     )
                 ],
                 [
-                    InlineKeyboardButton(
-                        "🎁 دعوت و دریافت رایگان",
-                        callback_data="ref"
-                    )
-                ],
-                [
                     back_button("home")
                 ]
             ])
@@ -4168,7 +4160,7 @@ async def text_handler(
 هر کاربر جدیدی که با لینک تو وارد شود، ثبت می‌شود.
 
 🎁 <b>پاداش دعوت</b>
-به ازای هر دعوت موفق، <b>3 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
+به ازای هر دعوت موفق، <b>1 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
 
 📦 موجودی پاداش فعلی: <b>{get_user(user_id)['referral_gb_balance'] or 0} GB</b>
 """,
@@ -4197,7 +4189,7 @@ async def text_handler(
 
 🎁 <b>۳. دعوت و دریافت رایگان</b>
 لینک دعوت اختصاصی خودت را از بخش «🎁 دعوت و دریافت رایگان» بردار و برای دوستانت بفرست.
-به ازای هر کاربر جدیدی که با لینک تو وارد ربات شود، <b>3 GB</b> پاداش رایگان برایت ثبت می‌شود.
+به ازای هر کاربر جدیدی که با لینک تو وارد ربات شود، <b>1 GB</b> پاداش رایگان 1 GB برایت ثبت می‌شود.
 
 📡 <b>۴. دریافت کانفیگ</b>
 بعد از تأیید پرداخت و تحویل سرویس توسط ادمین، کانفیگ برایت ارسال می‌شود و در «سرویس های من» هم قابل مشاهده است.
