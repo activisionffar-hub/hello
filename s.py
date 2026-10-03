@@ -101,6 +101,21 @@ def get_plan(plan_key):
     return None
 
 
+
+
+def get_service_type_name(plan_key):
+    """نام نوع سرویس را بدون جایگزین کردن نام کانفیگ کاربر برمی‌گرداند."""
+    plan = get_plan(plan_key) or {}
+    return plan.get("service_type") or plan.get("name") or str(plan_key)
+
+
+def get_saved_config_name(user_id, plan_key, service_config_name=None):
+    """نام انتخابی کاربر؛ اول خود سرویس، سپس سفارش پرداخت‌شده را بررسی می‌کند."""
+    name = (service_config_name or "").strip()
+    if name:
+        return name
+    return get_order_config_name(user_id, plan_key) or "ثبت نشده"
+
 def direct_plan_key(tier, gb):
     return f"direct_{tier}_{int(gb)}"
 
@@ -1201,9 +1216,11 @@ def services_text(user_id):
 
         plan = get_plan(service["plan_key"]) or {"name": service["plan_key"]}
 
+        service_type = get_service_type_name(service["plan_key"])
+        config_name = get_saved_config_name(user_id, service["plan_key"], service["config_name"])
         lines.extend([
-            f"🛰 <b>{plan['name']}</b>",
-            f"🏷 نام کانفیگ: <b>{escape(str(service['config_name'] or plan['name']))}</b>",
+            f"🛰 <b>{escape(str(service_type))}</b>",
+            f"🏷 نام کانفیگ: <b>{escape(str(config_name))}</b>",
             f"🔑 کد سرویس: "
             f"<code>{escape(str(service['code']))}</code>",
             f"📊 وضعیت: {status}",
@@ -1260,7 +1277,7 @@ def profile_text(user_id):
 
             subscription_lines.extend([
                 f"📦 <b>نوع اشتراک:</b> {escape(str(plan['name']))}",
-                f"🏷 <b>نام کانفیگ:</b> {escape(str(service['config_name'] or plan['name']))}",
+                f"🏷 <b>نام کانفیگ:</b> {escape(str(get_saved_config_name(user_id, service['plan_key'], service['config_name'])))}",
                 f"📊 <b>حجم کانفیگ:</b> {service['total_gb']} GB",
                 f"⏱ <b>مدت از زمان خرید:</b> {elapsed_days} روز",
                 f"🛒 <b>تاریخ خرید:</b> {jalali_date(service['purchased_at'])}",
@@ -3330,7 +3347,7 @@ async def text_handler(
             )
             return
 
-        config_name = get_order_config_name(target_user_id, plan_key) or (get_plan(plan_key) or {"name": plan_key})["name"]
+        config_name = get_order_config_name(target_user_id, plan_key) or "ثبت نشده"
 
         service_id, code = create_service(
             target_user_id,
@@ -3373,7 +3390,9 @@ async def text_handler(
 🎉 <b>سرویس شما آماده است</b>
 ━━━━━━━━━━━━━━━━━━
 
-🛰 <b>{plan['name']}</b>  •  📦 <b>{plan['gb']} GB</b>  •  ⏱ <b>{plan['days']} روز</b>
+🛰 <b>{escape(str(get_service_type_name(plan_key)))}</b>
+📦 حجم سرویس: <b>{plan['gb']} GB</b>
+⏱ مدت سرویس: <b>{plan['days']} روز</b>
 🏷 نام کانفیگ: <b>{escape(str(config_name))}</b>
 🔑 کد سرویس: <code>{code}</code>
 
