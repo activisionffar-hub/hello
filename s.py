@@ -362,6 +362,31 @@ def create_order(user_id, plan_key):
     return order_id
 
 
+def config_name_exists(config_name, exclude_order_id=None):
+    name = (config_name or "").strip().lower()
+    if not name:
+        return False
+    con = db()
+    if exclude_order_id is None:
+        row = con.execute(
+            """SELECT 1 FROM orders WHERE lower(trim(config_name))=?
+               UNION ALL
+               SELECT 1 FROM services WHERE lower(trim(config_name))=?
+               LIMIT 1""",
+            (name, name)
+        ).fetchone()
+    else:
+        row = con.execute(
+            """SELECT 1 FROM orders WHERE lower(trim(config_name))=? AND id<>?
+               UNION ALL
+               SELECT 1 FROM services WHERE lower(trim(config_name))=?
+               LIMIT 1""",
+            (name, exclude_order_id, name)
+        ).fetchone()
+    con.close()
+    return row is not None
+
+
 def set_order_config_name(order_id, user_id, config_name):
     name = (config_name or "").strip()[:40]
     if not name:
@@ -1801,6 +1826,10 @@ async def callbacks(
             await q.answer("❌ سفارش پیدا نشد.", show_alert=True)
             return
 
+        if order["status"] != "paid":
+            await q.answer("⏳ نام کانفیگ فقط بعد از تأیید رسید یا پرداخت با کیف پول فعال می‌شود.", show_alert=True)
+            return
+
         context.user_data["awaiting_config_name_order_id"] = order_id
 
         await q.edit_message_text(
@@ -2880,7 +2909,8 @@ async def photo_handler(
         )
 
         context.user_data["awaiting_receipt_order_id"] = None
-        context.user_data["awaiting_config_name_order_id"] = order_id
+        # نام کانفیگ فقط بعد از تأیید ادمین قابل انتخاب است.
+        context.user_data["awaiting_config_name_order_id"] = None
 
         await update.message.reply_text(
             f"""
@@ -2896,14 +2926,9 @@ async def photo_handler(
 
 ⏳ رسید برای بررسی ادمین ارسال شد.
 
-📌 بعد از تأیید رسید، نام کانفیگت را انتخاب کن.
-
-برای ادامه روی دکمه زیر بزن.
+📌 پس از تأیید ادمین، پیام تأیید برایت ارسال می‌شود و آن زمان می‌توانی نام کانفیگت را انتخاب کنی.
 """,
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("▶️ ادامه و انتخاب نام کانفیگ", callback_data=f"config_name_continue:{order_id}")]
-            ])
+            parse_mode=ParseMode.HTML
         )
 
         plan = PLANS.get(
@@ -3249,12 +3274,47 @@ async def text_handler(
         order_id = context.user_data.get("awaiting_config_name_order_id")
         config_name = text.strip()
 
+        panel_buttons = {
+            "👤 پروفایل و کیف پول", "🛒 فروشگاه اشتراک‌ها", "📡 سرویس های من",
+            "🎁 دعوت و دریافت رایگان", "📖 آموزش و راهنما", "🛟 تماس با پشتیبانی",
+            "💰 شارژ کیف پول"
+        }
+        if config_name in panel_buttons:
+            await user_reply(
+                update, context,
+                "⚠️ هنوز نام کانفیگت ثبت نشده است.\n\nلطفاً ابتدا یک نام دلخواه مثل <b>ali1370</b> ارسال کن.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
         if len(config_name) < 2:
-            await user_reply(update, context, "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.")
+            await user_reply(update, context, "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.\nمثال: <b>ali1370</b>", parse_mode=ParseMode.HTML)
             return
 
         if len(config_name) > 40:
             await user_reply(update, context, "❌ نام کانفیگ حداکثر ۴۰ کاراکتر باشد.")
+            return
+
+        if config_name_exists(config_name, exclude_order_id=order_id):
+            await user_reply(
+                update, context,
+                "❌ این نام کانفیگ قبلاً توسط کاربر دیگری انتخاب شده است.\n\nیک نام دیگر مثل <b>ali1370</b> انتخاب کن.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        # فقط سفارش پرداخت‌شده/تأییدشده اجازه ثبت نام دارد.
+        con = db()
+        paid_row = con.execute(
+            "SELECT status FROM orders WHERE id=? AND user_id=?",
+            (order_id, user_id)
+        ).fetchone()
+        con.close()
+        if not paid_row or paid_row["status"] != "paid":
+            await user_reply(
+                update, context,
+                "⏳ هنوز تأیید پرداخت انجام نشده است. بعد از تأیید ادمین می‌توانی نام کانفیگ را انتخاب کنی."
+            )
             return
 
         if not set_order_config_name(order_id, user_id, config_name):
