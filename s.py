@@ -123,6 +123,23 @@ def init_db():
         "INTEGER DEFAULT 0"
     )
 
+    ensure_column(
+        con,
+        "users",
+        "referral_gb_balance",
+        "INTEGER DEFAULT 0"
+    )
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS referral_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            inviter_id INTEGER NOT NULL,
+            invited_user_id INTEGER UNIQUE NOT NULL,
+            reward_gb INTEGER NOT NULL DEFAULT 3,
+            created_at TEXT NOT NULL
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS services (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -204,6 +221,8 @@ def ensure_user(tg_user, referred_by=None):
         (tg_user.id,)
     ).fetchone()
 
+    is_new = row is None
+
     if not row:
         ref_code = secrets.token_hex(4).upper()
 
@@ -247,6 +266,39 @@ def ensure_user(tg_user, referred_by=None):
 
     con.commit()
     con.close()
+    return is_new
+
+def add_referral_reward(inviter_id, invited_user_id):
+    if not inviter_id or inviter_id == invited_user_id:
+        return False
+
+    con = db()
+    try:
+        inviter = con.execute(
+            "SELECT user_id FROM users WHERE user_id=?",
+            (inviter_id,)
+        ).fetchone()
+        if not inviter:
+            return False
+
+        cur = con.cursor()
+        cur.execute("""
+            INSERT OR IGNORE INTO referral_rewards
+            (inviter_id, invited_user_id, reward_gb, created_at)
+            VALUES (?, ?, 3, ?)
+        """, (inviter_id, invited_user_id, datetime.now().isoformat(timespec="seconds")))
+
+        if cur.rowcount == 1:
+            cur.execute(
+                "UPDATE users SET referral_gb_balance = COALESCE(referral_gb_balance, 0) + 3 WHERE user_id=?",
+                (inviter_id,)
+            )
+            con.commit()
+            return True
+        con.commit()
+        return False
+    finally:
+        con.close()
 
 
 def get_user(user_id):
@@ -1114,15 +1166,12 @@ def card_payment_text(title, amount, extra=""):
 ━━━━━━━━━━━━━━━━━━
 
 💰 <b>مبلغ پرداخت</b>
-{format_price(amount)}
+<b>{format_price(amount)}</b>
 {extra_block}
 💳 <b>اطلاعات پرداخت</b>
 
-🏦 شماره کارت:
-<code>{escape(CARD_NUMBER)}</code>
-
-👤 به نام:
-<b>{escape(CARD_HOLDER)}</b>
+🏦 <b>شماره کارت:</b> <code>{escape(CARD_NUMBER)}</code>
+👤 <b>به نام:</b> <b>{escape(CARD_HOLDER)}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
@@ -1174,7 +1223,10 @@ async def start(
         except ValueError:
             pass
 
-    ensure_user(user, referred_by)
+    is_new_user = ensure_user(user, referred_by)
+
+    if is_new_user and referred_by:
+        add_referral_reward(referred_by, user.id)
 
     # ادمین پنل مشتری نبیند
     if user.id == ADMIN_ID:
@@ -1573,6 +1625,10 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
+              <b>50,000 تومان</b>
+
+━━━━━━━━━━━━━━━━━━
+
 🔹 مبلغ را با عدد وارد کن.
 🔹 حداقل مبلغ شارژ: <b>1,000 تومان</b>
 """,
@@ -1627,6 +1683,45 @@ async def callbacks(
         return
 
     # =====================================================
+    # RESEND CONFIG
+    # =====================================================
+
+    if data.startswith("resend_config:"):
+        try:
+            service_id = int(data.split(":", 1)[1])
+        except ValueError:
+            await q.answer("❌ سرویس نامعتبر است.", show_alert=True)
+            return
+
+        con = db()
+        service = con.execute(
+            "SELECT * FROM services WHERE id=? AND user_id=?",
+            (service_id, user_id)
+        ).fetchone()
+        con.close()
+
+        if not service:
+            await q.answer("❌ سرویس پیدا نشد.", show_alert=True)
+            return
+
+        plan = PLANS.get(service["plan_key"], {"name": service["plan_key"]})
+        await q.answer("📤 کانفیگ دوباره ارسال شد.")
+        await q.message.reply_text(
+            f"""
+📤 <b>ارسال دوباره کانفیگ</b>
+━━━━━━━━━━━━━━━━━━
+
+🛰 <b>{escape(str(plan['name']))}</b>
+🔑 کد سرویس: <code>{escape(str(service['code']))}</code>
+
+🔐 <b>کانفیگ</b>
+<code>{escape(str(service['config']))}</code>
+""",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # =====================================================
     # SERVICES
     # =====================================================
 
@@ -1634,6 +1729,13 @@ async def callbacks(
         services = get_services(user_id)
         rows = []
         if services:
+            for service in services:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"📤 ارسال دوباره کانفیگ {service['code']}",
+                        callback_data=f"resend_config:{service['id']}"
+                    )
+                ])
             rows.append([
                 InlineKeyboardButton(
                     "🔄 تمدید سرویس",
@@ -1819,11 +1921,12 @@ async def callbacks(
 
 این لینک را برای دوستانت ارسال کن.
 
-هر کاربر جدیدی که از لینک تو وارد شود
-در سیستم ثبت خواهد شد.
+هر کاربر جدیدی که با لینک تو وارد شود، ثبت می‌شود.
 
-🎁 سیستم پاداش و اعتبار دعوت
-در مرحله بعد قابل فعال‌سازی است.
+🎁 <b>پاداش دعوت</b>
+به ازای هر دعوت موفق، <b>3 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
+
+📦 موجودی پاداش فعلی: <b>{get_user(user_id)['referral_gb_balance'] or 0} GB</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -2949,32 +3052,17 @@ async def text_handler(
             await context.bot.send_message(
                 chat_id=target_user_id,
                 text=f"""
-🎉 <b>سرویس شما آماده شد</b>
-
+🎉 <b>سرویس شما آماده است</b>
 ━━━━━━━━━━━━━━━━━━
 
-🛰 سرویس:
-<b>{plan['name']}</b>
+🛰 <b>{plan['name']}</b>  •  📦 <b>{plan['gb']} GB</b>  •  ⏱ <b>{plan['days']} روز</b>
+🔑 کد سرویس: <code>{code}</code>
 
-📦 حجم:
-<b>{plan['gb']} GB</b>
-
-⏱ اعتبار:
-<b>{plan['days']} روز</b>
-
-🔑 کد سرویس:
-<code>{code}</code>
-
-━━━━━━━━━━━━━━━━━━
-
-<b>🔐 کانفیگ:</b>
-
+🔐 <b>کانفیگ</b>
 <code>{escape(config)}</code>
 
 ━━━━━━━━━━━━━━━━━━
-
-برای مشاهده سرویس‌های خودت،
-وارد بخش «📡 سرویس های من» شو.
+📡 برای مشاهده یا ارسال دوباره کانفیگ، وارد «سرویس های من» شو.
 """,
                 parse_mode=ParseMode.HTML
             )
@@ -3175,6 +3263,13 @@ async def text_handler(
         services = get_services(user_id)
         rows = []
         if services:
+            for service in services:
+                rows.append([
+                    InlineKeyboardButton(
+                        f"📤 ارسال دوباره کانفیگ {service['code']}",
+                        callback_data=f"resend_config:{service['id']}"
+                    )
+                ])
             rows.append([
                 InlineKeyboardButton(
                     "🔄 تمدید سرویس",
@@ -3224,11 +3319,12 @@ async def text_handler(
 
 این لینک را برای دوستانت ارسال کن.
 
-هر کاربر جدیدی که از لینک تو وارد شود
-در سیستم ثبت خواهد شد.
+هر کاربر جدیدی که با لینک تو وارد شود، ثبت می‌شود.
 
-🎁 سیستم پاداش و اعتبار دعوت
-در مرحله بعد قابل فعال‌سازی است.
+🎁 <b>پاداش دعوت</b>
+به ازای هر دعوت موفق، <b>3 GB</b> حجم رایگان به پاداش دعوتت اضافه می‌شود.
+
+📦 موجودی پاداش فعلی: <b>{get_user(user_id)['referral_gb_balance'] or 0} GB</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=user_panel()
