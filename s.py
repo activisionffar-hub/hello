@@ -30,7 +30,7 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = "8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g"
+BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
 
 ADMIN_ID = 8815017184
 SUPPORT_USERNAME = "@kaletek_Support"
@@ -738,6 +738,87 @@ def reject_wallet_deposit(deposit_id, admin_id):
 
 
 # =========================================================
+# WALLET PURCHASE / RENEWAL
+# =========================================================
+
+def pay_order_with_wallet(order_id, user_id):
+    """پرداخت سفارش با کیف پول؛ عملیات اتمیک و ضد دوباره‌پرداخت."""
+    con = db()
+    try:
+        con.execute("BEGIN")
+
+        order = con.execute("""
+            SELECT * FROM orders
+            WHERE id=? AND user_id=?
+        """, (order_id, user_id)).fetchone()
+
+        if not order:
+            con.rollback()
+            return None, None, "not_found"
+
+        if order["status"] == "paid":
+            con.rollback()
+            return order, None, "already_paid"
+
+        if order["status"] == "receipt_pending":
+            con.rollback()
+            return order, None, "receipt_pending"
+
+        user = con.execute(
+            "SELECT wallet_balance FROM users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
+        balance = int((user["wallet_balance"] if user else 0) or 0)
+
+        if balance < order["amount"]:
+            con.rollback()
+            return order, balance, "insufficient"
+
+        cur = con.execute("""
+            UPDATE users
+            SET wallet_balance = wallet_balance - ?
+            WHERE user_id=? AND COALESCE(wallet_balance,0) >= ?
+        """, (order["amount"], user_id, order["amount"]))
+
+        if cur.rowcount != 1:
+            con.rollback()
+            return order, balance, "insufficient"
+
+        cur = con.execute("""
+            UPDATE orders
+            SET status='paid'
+            WHERE id=? AND user_id=? AND status IN ('pending','rejected')
+        """, (order_id, user_id))
+
+        if cur.rowcount != 1:
+            con.rollback()
+            return order, balance, "already_processed"
+
+        con.execute("""
+            INSERT INTO wallet_transactions
+            (user_id, amount, type, reference_id, description, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            -order["amount"],
+            "purchase",
+            order_id,
+            f"پرداخت سفارش #{order_id} از کیف پول",
+            datetime.now().isoformat(timespec="seconds"),
+        ))
+
+        new_balance = balance - order["amount"]
+        con.commit()
+        return order, new_balance, "paid"
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+# =========================================================
 # HELPERS
 # =========================================================
 
@@ -965,48 +1046,38 @@ def profile_text(user_id):
     if not user:
         return "❌ اطلاعات حساب پیدا نشد."
 
-    active_services = sum(
-        1
-        for service in services
-        if service["active"]
-    )
+    active_services = sum(1 for service in services if service["active"])
+    total_gb = sum(float(service["total_gb"] or 0) for service in services)
 
-    username = (
-        f"@{user['username']}"
-        if user["username"]
-        else "ندارد"
-    )
+    invited_count = 0
+    con = db()
+    row = con.execute(
+        "SELECT COUNT(*) AS c FROM users WHERE referred_by=?",
+        (user_id,)
+    ).fetchone()
+    if row:
+        invited_count = row["c"]
+    con.close()
 
-    balance = user["wallet_balance"] or 0
+    balance = int(user["wallet_balance"] or 0)
+    account_level = "همکار تجاری"
+    subscription_status = (
+        "فعال و آماده استفاده"
+        if active_services > 0
+        else "بدون اشتراک فعال"
+    )
 
     return f"""
-👤 <b>پروفایل و کیف پول</b>
-
-━━━━━━━━━━━━━━━━━━
-
-🆔 شناسه:
-<code>{user_id}</code>
-
-👤 نام:
-{escape(user['first_name'] or '—')}
-
-🔗 یوزرنیم:
-{escape(username)}
-
-📦 تعداد سرویس:
-<b>{len(services)}</b>
-
-🟢 سرویس فعال:
-<b>{active_services}</b>
-
-💰 موجودی کیف پول:
-<b>{format_price(balance)}</b>
-
-🎁 کد دعوت:
-<code>{escape(user['ref_code'])}</code>
-
-📅 عضویت:
-{jalali_date(user['created_at'])}
+💳 <b>پروفایل کاربری شما</b>
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+🙂 نام: {escape(user['first_name'] or '—')}
+🖥 شناسه کاربری: <code>{user_id}</code>
+😀 سطح حساب: {account_level}
+📊 ترافیک کل دریافتی: {total_gb:g} GB
+💰 موجودی کیف پول: {format_price(balance)}
+👥 تعداد دعوت‌شدگان: {invited_count} نفر
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+⚡️ وضعیت اشتراک: <b>{subscription_status}</b>
 """
 
 
@@ -1040,18 +1111,23 @@ def card_payment_text(title, amount, extra=""):
 """
 
 
-def order_payment_keyboard(order_id):
-    return InlineKeyboardMarkup([
-        [
+def order_payment_keyboard(order_id, include_wallet=True):
+    rows = []
+    if include_wallet:
+        rows.append([
             InlineKeyboardButton(
-                "📤 ارسال رسید",
-                callback_data=f"receipt:{order_id}"
+                "💰 پرداخت با کیف پول",
+                callback_data=f"walletpay:{order_id}"
             )
-        ],
-        [
-            back_button("buy")
-        ],
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            "💳 پرداخت با کارت و ارسال رسید",
+            callback_data=f"pay:{order_id}"
+        )
     ])
+    rows.append([back_button("buy")])
+    return InlineKeyboardMarkup(rows)
 
 
 # =========================================================
@@ -1247,27 +1323,98 @@ async def callbacks(
 
 ━━━━━━━━━━━━━━━━━━
 
-بعد از واریز مبلغ، روی
-«📤 ارسال رسید» بزن.
+💰 اگر موجودی کیف پولت کافی باشد، می‌توانی مستقیم از کیف پول پرداخت کنی.
+
+💳 یا می‌توانی با کارت پرداخت کنی و رسید بفرستی.
 """
 
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "📤 ارسال رسید",
-                    callback_data=f"receipt:{order_id}"
-                )
-            ],
-            [
-                back_button("buy")
-            ],
-        ])
+        keyboard = order_payment_keyboard(order_id, include_wallet=True)
 
         await q.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard
         )
+        return
+
+    # =====================================================
+    # PAY ORDER WITH WALLET
+    # =====================================================
+
+    if data.startswith("walletpay:"):
+        try:
+            order_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+
+        order, new_balance, status = pay_order_with_wallet(
+            order_id, user_id
+        )
+
+        if status == "not_found":
+            await q.answer("❌ سفارش پیدا نشد.", show_alert=True)
+            return
+
+        if status == "already_paid":
+            await q.answer("✅ این سفارش قبلاً پرداخت شده است.", show_alert=True)
+            return
+
+        if status == "receipt_pending":
+            await q.answer("⏳ رسید این سفارش در انتظار بررسی است.", show_alert=True)
+            return
+
+        if status == "insufficient":
+            await q.answer(
+                f"❌ موجودی کافی نیست. موجودی شما: {format_price(new_balance or 0)}",
+                show_alert=True
+            )
+            return
+
+        if status == "already_processed":
+            await q.answer("⚠️ این سفارش قبلاً پردازش شده است.", show_alert=True)
+            return
+
+        plan = PLANS.get(order["plan_key"], {"name": order["plan_key"], "gb": 0, "days": 0})
+
+        await q.edit_message_text(
+            f"""
+✅ <b>پرداخت با کیف پول موفق بود</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🧾 سفارش: <code>#{order_id}</code>
+⚡ سرویس: <b>{escape(plan['name'])}</b>
+💰 مبلغ پرداخت‌شده: <b>{format_price(order['amount'])}</b>
+💳 موجودی جدید: <b>{format_price(new_balance)}</b>
+
+⏳ پرداخت ثبت شد و سفارش برای تحویل کانفیگ در اختیار ادمین قرار گرفت.
+
+بعد از تحویل، کانفیگ برایت ارسال می‌شود.
+""",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[back_button("home")]])
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"""
+💰 <b>پرداخت با کیف پول</b>
+
+━━━━━━━━━━━━━━━━━━
+
+🧾 سفارش: <code>#{order_id}</code>
+👤 کاربر: <code>{user_id}</code>
+⚡ پلن: <b>{escape(plan['name'])}</b>
+💵 مبلغ: <b>{format_price(order['amount'])}</b>
+💳 روش پرداخت: کیف پول
+
+📌 سفارش پرداخت شده و منتظر تحویل دستی سرویس است.
+""",
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
         return
 
     # =====================================================
@@ -1297,7 +1444,7 @@ async def callbacks(
                 order["amount"]
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=order_payment_keyboard(order_id)
+            reply_markup=order_payment_keyboard(order_id, include_wallet=(order["status"] in ("pending", "rejected")))
         )
         return
 
@@ -1442,20 +1589,28 @@ async def callbacks(
     # =====================================================
 
     if data == "services":
+        services = get_services(user_id)
+        rows = []
+        if services:
+            rows.append([
+                InlineKeyboardButton(
+                    "🔄 تمدید سرویس",
+                    callback_data="renew"
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    "🛒 خرید سرویس",
+                    callback_data="buy"
+                )
+            ])
+        rows.append([back_button("home")])
+
         await q.edit_message_text(
             services_text(user_id),
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔄 تمدید سرویس",
-                        callback_data="renew"
-                    )
-                ],
-                [
-                    back_button("home")
-                ]
-            ])
+            reply_markup=InlineKeyboardMarkup(rows)
         )
         return
 
@@ -1546,13 +1701,17 @@ async def callbacks(
             reply_markup=InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
-                        "📤 ارسال رسید",
-                        callback_data=f"receipt:{order_id}"
+                        "💰 پرداخت با کیف پول",
+                        callback_data=f"walletpay:{order_id}"
                     )
                 ],
                 [
-                    back_button("renew")
-                ]
+                    InlineKeyboardButton(
+                        "💳 پرداخت با کارت و ارسال رسید",
+                        callback_data=f"pay:{order_id}"
+                    )
+                ],
+                [back_button("renew")]
             ])
         )
         return
@@ -2970,20 +3129,28 @@ async def text_handler(
     # =====================================================
 
     if text == "📡 سرویس های من":
+        services = get_services(user_id)
+        rows = []
+        if services:
+            rows.append([
+                InlineKeyboardButton(
+                    "🔄 تمدید سرویس",
+                    callback_data="renew"
+                )
+            ])
+        else:
+            rows.append([
+                InlineKeyboardButton(
+                    "🛒 خرید سرویس",
+                    callback_data="buy"
+                )
+            ])
+        rows.append([back_button("home")])
+
         await update.message.reply_text(
             services_text(user_id),
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "🔄 تمدید سرویس",
-                        callback_data="renew"
-                    )
-                ],
-                [
-                    back_button("home")
-                ]
-            ])
+            reply_markup=InlineKeyboardMarkup(rows)
         )
         return
 
@@ -3032,22 +3199,31 @@ async def text_handler(
     if text == "📖 آموزش و راهنما":
         await update.message.reply_text(
             """
-📖 <b>آموزش و راهنما</b>
+📚 <b>راهنمای استفاده از سرویس</b>
 
-━━━━━━━━━━━━━━━━━━
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
 
-🔹 بعد از خرید سرویس، کانفیگ برایت ارسال می‌شود.
+🛒 <b>۱. خرید سرویس</b>
+از بخش «فروشگاه اشتراک‌ها» پلن موردنظرت را انتخاب کن.
+می‌توانی هزینه را از کیف پول پرداخت کنی یا با کارت و ارسال رسید پرداخت کنی.
 
-🔹 کانفیگ را کپی کن.
+💰 <b>۲. شارژ کیف پول</b>
+از «پروفایل و کیف پول» مبلغ دلخواهت را وارد کن، واریز را انجام بده و تصویر رسید را ارسال کن. پس از تأیید ادمین، مبلغ به موجودی کیف پول اضافه می‌شود.
 
-🔹 آن را داخل برنامه سازگار با نوع کانفیگ وارد کن.
+📡 <b>۳. دریافت کانفیگ</b>
+بعد از تأیید پرداخت و تحویل سرویس توسط ادمین، کانفیگ برایت ارسال می‌شود و در «سرویس های من» هم قابل مشاهده است.
 
-🔹 سپس اتصال را فعال کن.
+🔄 <b>۴. تمدید</b>
+اگر سرویس فعال داشته باشی، از بخش «سرویس های من» می‌توانی آن را تمدید کنی و هزینه را از کیف پول پرداخت کنی یا رسید ارسال کنی.
 
-━━━━━━━━━━━━━━━━━━
+🔐 <b>۵. اتصال</b>
+کانفیگ را کپی کن و داخل برنامه سازگار با نوع کانفیگ وارد کن، سپس اتصال را فعال کن.
 
-اگر مشکلی داشتی، از بخش
-«🛟 تماس با پشتیبانی» استفاده کن.
+🛟 <b>مشکل داشتی؟</b>
+از بخش «تماس با پشتیبانی» با پشتیبانی در ارتباط باش.
+
+┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄
+✨ <b>اگر در هر مرحله مشکلی داشتی، شماره سفارش یا کد سرویس را همراه پیامت ارسال کن.</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=user_panel()
