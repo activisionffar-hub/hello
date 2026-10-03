@@ -1939,6 +1939,7 @@ async def callbacks(
             return
 
         context.user_data["awaiting_receipt_order_id"] = None
+        context.user_data["awaiting_wallet_receipt"] = True
 
         await q.message.reply_text(
             f"""
@@ -1997,7 +1998,10 @@ async def callbacks(
 مثال:
 <b>ali1370</b>
 
-📌 این نام در «📡 سرویس های من» و پیام‌های مربوط به کانفیگ نمایش داده می‌شود.
+📌 نام کانفیگ باید فقط شامل <b>اعداد و حروف انگلیسی</b> باشد.
+❌ حروف فارسی، فاصله و علامت‌های دیگر مجاز نیستند.
+
+این نام در «📡 سرویس های من» و پیام‌های مربوط به کانفیگ نمایش داده می‌شود.
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -3189,6 +3193,7 @@ async def photo_handler(
         )
 
         context.user_data["wallet_amount"] = None
+        context.user_data["awaiting_wallet_receipt"] = False
 
         await update.message.reply_text(
             f"""
@@ -3412,7 +3417,7 @@ async def text_handler(
     ensure_user(update.effective_user)
 
     # =====================================================
-    # PANEL BUTTONS CANCEL PENDING CONFIG-NAME INPUT
+    # PANEL BUTTONS / PENDING INPUT STATES
     # =====================================================
 
     panel_buttons = {
@@ -3421,9 +3426,128 @@ async def text_handler(
         "💰 شارژ کیف پول"
     }
 
-    if text in panel_buttons:
+    # وقتی منتظر نام کانفیگ هستیم، هیچ متن یا دکمه پنل نباید وارد
+    # مسیر عادی پنل شود؛ همه باید به‌عنوان ورودی نام نامعتبر رد شوند.
+    pending_name_order_id = context.user_data.get("awaiting_config_name_order_id")
+    if pending_name_order_id:
+        if text in panel_buttons:
+            await user_reply(
+                update, context,
+                "❌ هنوز در مرحله انتخاب نام کانفیگ هستی. فقط نام کانفیگ را با حروف انگلیسی و اعداد وارد کن.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        try:
+            order_id = int(pending_name_order_id)
+        except (TypeError, ValueError):
+            context.user_data["awaiting_config_name_order_id"] = None
+            await user_reply(update, context, "❌ سفارش نامعتبر است. دوباره از بخش خرید اقدام کن.")
+            return
+
+        config_name = text.strip()
+
+        if len(config_name) < 2:
+            await user_reply(
+                update, context,
+                "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.\n\n📌 فقط <b>اعداد و حروف انگلیسی</b> مجاز هستند.\nمثال: <b>ali1370</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if len(config_name) > 40:
+            await user_reply(update, context, "❌ نام کانفیگ حداکثر ۴۰ کاراکتر باشد.")
+            return
+
+        # فقط حروف انگلیسی و اعداد؛ فاصله، آندرلاین، خط تیره و فارسی هم رد می‌شوند.
+        if not config_name.isascii() or not config_name.isalnum():
+            await user_reply(
+                update, context,
+                "❌ نام کانفیگ نامعتبر است.\n\n📌 فقط و فقط <b>اعداد و حروف انگلیسی</b> مجاز هستند.\n❌ حروف فارسی، فاصله و علامت‌های دیگر مجاز نیستند.\n\nمثال صحیح: <b>ali1370</b>",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        con = db()
+        order = con.execute(
+            "SELECT id, user_id, status FROM orders WHERE id=? AND user_id=?",
+            (order_id, user_id)
+        ).fetchone()
+        con.close()
+
+        if not order:
+            context.user_data["awaiting_config_name_order_id"] = None
+            await user_reply(update, context, "❌ سفارش پیدا نشد. لطفاً دوباره از بخش خرید اقدام کن.")
+            return
+
+        if order["status"] != "paid":
+            await user_reply(update, context, "⏳ هنوز تأیید پرداخت انجام نشده است. بعد از تأیید ادمین می‌توانی نام کانفیگ را انتخاب کنی.")
+            return
+
+        if config_name_exists(config_name, exclude_order_id=order_id):
+            await user_reply(
+                update, context,
+                "❌ این نام کانفیگ قبلاً استفاده شده است.\n\nیک نام دیگر مثل <b>ali1370</b> انتخاب کن.",
+                parse_mode=ParseMode.HTML
+            )
+            return
+
+        if not set_order_config_name(order_id, user_id, config_name):
+            await user_reply(update, context, "❌ ثبت نام کانفیگ انجام نشد. دوباره تلاش کن.")
+            return
+
+        try:
+            con = db()
+            order_row = con.execute(
+                "SELECT plan_key, created_at FROM orders WHERE id=? AND user_id=?",
+                (order_id, user_id)
+            ).fetchone()
+            if order_row:
+                con.execute(
+                    """UPDATE services SET config_name=?
+                       WHERE id=(SELECT id FROM services
+                                 WHERE user_id=? AND plan_key=?
+                                   AND purchased_at >= ?
+                                 ORDER BY id DESC LIMIT 1)""",
+                    (config_name, user_id, order_row["plan_key"], order_row["created_at"])
+                )
+                con.commit()
+            con.close()
+        except Exception as e:
+            print("CONFIG NAME SERVICE SYNC ERROR:", repr(e))
+
         context.user_data["awaiting_config_name_order_id"] = None
-        context.user_data["awaiting_custom_gb_tier"] = None
+        await user_reply(
+            update, context,
+            f"🏷 <b>نام کانفیگ با موفقیت ثبت شد</b>\n\nنام انتخابی: <b>{escape(config_name)}</b>\n\nپس از تحویل سرویس، همین نام کنار کانفیگت نمایش داده می‌شود.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=user_panel()
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(f"🏷 <b>نام کانفیگ کاربر ثبت شد</b>\n\n"
+                      f"🧾 سفارش: <code>#{order_id}</code>\n"
+                      f"👤 کاربر: <code>{user_id}</code>\n"
+                      f"🔗 یوزرنیم: <b>{escape('@' + update.effective_user.username if update.effective_user.username else 'ندارد')}</b>\n"
+                      f"🏷 نام کانفیگ: <b>{escape(config_name)}</b>"),
+                parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
+        return
+
+    # هنگام ارسال رسید: متن و هر پیام غیرعکس خطا می‌دهد،
+    # اما دکمه‌های پنل باید بدون خطا وارد مسیر عادی خودشان شوند.
+    if (context.user_data.get("awaiting_receipt_order_id") or
+            context.user_data.get("awaiting_wallet_receipt")) and text not in panel_buttons:
+        await user_reply(
+            update, context,
+            "❌ در این مرحله فقط <b>عکس رسید پرداخت</b> را ارسال کن.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     # =====================================================
     # CUSTOM DIRECT VOLUME INPUT
@@ -3476,94 +3600,6 @@ async def text_handler(
             reply_markup=order_payment_keyboard(order_id, include_wallet=True)
         )
         return
-
-    # =====================================================
-    # CONFIG NAME INPUT
-    # =====================================================
-
-    pending_name_order_id = context.user_data.get("awaiting_config_name_order_id")
-    if pending_name_order_id:
-        try:
-            order_id = int(pending_name_order_id)
-        except (TypeError, ValueError):
-            context.user_data["awaiting_config_name_order_id"] = None
-            await user_reply(update, context, "❌ سفارش نامعتبر است. دوباره از بخش خرید اقدام کن.")
-            return
-
-        config_name = text.strip()
-
-        # دکمه‌های پنل باید حالت ورود نام را لغو کنند و خود دکمه هم اجرا شود.
-        if text in panel_buttons:
-            context.user_data["awaiting_config_name_order_id"] = None
-        else:
-            if len(config_name) < 2:
-                await user_reply(update, context, "❌ نام کانفیگ باید حداقل ۲ کاراکتر باشد.\nمثال: <b>ali1370</b>", parse_mode=ParseMode.HTML)
-                return
-
-            if len(config_name) > 40:
-                await user_reply(update, context, "❌ نام کانفیگ حداکثر ۴۰ کاراکتر باشد.")
-                return
-
-            con = db()
-            order = con.execute(
-                "SELECT id, user_id, status FROM orders WHERE id=? AND user_id=?",
-                (order_id, user_id)
-            ).fetchone()
-            con.close()
-
-            if not order:
-                context.user_data["awaiting_config_name_order_id"] = None
-                await user_reply(update, context, "❌ سفارش پیدا نشد. لطفاً دوباره از بخش خرید اقدام کن.")
-                return
-
-            if order["status"] != "paid":
-                await user_reply(update, context, "⏳ هنوز تأیید پرداخت انجام نشده است. بعد از تأیید ادمین می‌توانی نام کانفیگ را انتخاب کنی.")
-                return
-
-            if config_name_exists(config_name, exclude_order_id=order_id):
-                await user_reply(update, context, "❌ این نام کانفیگ قبلاً استفاده شده است.\n\nیک نام دیگر مثل <b>ali1370</b> انتخاب کن.", parse_mode=ParseMode.HTML)
-                return
-
-            if not set_order_config_name(order_id, user_id, config_name):
-                await user_reply(update, context, "❌ ثبت نام کانفیگ انجام نشد. دوباره تلاش کن.")
-                return
-
-            try:
-                con = db()
-                order_row = con.execute(
-                    "SELECT plan_key, created_at FROM orders WHERE id=? AND user_id=?",
-                    (order_id, user_id)
-                ).fetchone()
-                if order_row:
-                    con.execute(
-                        """UPDATE services SET config_name=?
-                           WHERE id=(SELECT id FROM services
-                                     WHERE user_id=? AND plan_key=?
-                                       AND purchased_at >= ?
-                                     ORDER BY id DESC LIMIT 1)""",
-                        (config_name, user_id, order_row["plan_key"], order_row["created_at"])
-                    )
-                    con.commit()
-                con.close()
-            except Exception as e:
-                print("CONFIG NAME SERVICE SYNC ERROR:", repr(e))
-
-            context.user_data["awaiting_config_name_order_id"] = None
-            await user_reply(update, context, f"🏷 <b>نام کانفیگ با موفقیت ثبت شد</b>\n\nنام انتخابی: <b>{escape(config_name)}</b>\n\nپس از تحویل سرویس، همین نام کنار کانفیگت نمایش داده می‌شود.", parse_mode=ParseMode.HTML, reply_markup=user_panel())
-
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(f"🏷 <b>نام کانفیگ کاربر ثبت شد</b>\n\n"
-                          f"🧾 سفارش: <code>#{order_id}</code>\n"
-                          f"👤 کاربر: <code>{user_id}</code>\n"
-                          f"🔗 یوزرنیم: <b>{escape('@' + update.effective_user.username if update.effective_user.username else 'ندارد')}</b>\n"
-                          f"🏷 نام کانفیگ: <b>{escape(config_name)}</b>"),
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception:
-                pass
-            return
 
     # =====================================================
     # WALLET AMOUNT INPUT
