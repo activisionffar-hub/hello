@@ -1086,28 +1086,30 @@ def profile_text(user_id):
 # =========================================================
 
 def card_payment_text(title, amount, extra=""):
+    extra_block = f"\n{extra.strip()}\n" if extra.strip() else ""
     return f"""
-💳 <b>{title}</b>
+<b>✦ Kaletek</b>
 
+💳 <b>{title}</b>
 ━━━━━━━━━━━━━━━━━━
 
-💰 مبلغ:
-<b>{format_price(amount)}</b>
-
-{extra}
-
+💰 <b>مبلغ پرداخت</b>
+{format_price(amount)} تومان
+{extra_block}
 💳 <b>اطلاعات پرداخت</b>
 
-شماره کارت:
+🏦 شماره کارت:
 <code>{escape(CARD_NUMBER)}</code>
 
-به نام:
+👤 به نام:
 <b>{escape(CARD_HOLDER)}</b>
 
 ━━━━━━━━━━━━━━━━━━
 
-بعد از واریز، تصویر رسید را از طریق
+📌 پس از واریز، تصویر واضح رسید را از طریق
 دکمه «📤 ارسال رسید» ارسال کن.
+
+⏳ درخواستت پس از بررسی ادمین نهایی می‌شود.
 """
 
 
@@ -1364,9 +1366,25 @@ async def callbacks(
             return
 
         if status == "insufficient":
-            await q.answer(
-                f"❌ موجودی کافی نیست. موجودی شما: {format_price(new_balance or 0)}",
-                show_alert=True
+            current_balance = new_balance or 0
+            await q.edit_message_text(
+                f"""
+⚠️ <b>موجودی کیف پول کافی نیست</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 مبلغ سفارش: <b>{format_price(order['amount'])} تومان</b>
+💳 موجودی فعلی: <b>{format_price(current_balance)} تومان</b>
+
+🔸 برای پرداخت این سفارش، ابتدا کیف پولت را به اندازه کافی شارژ کن.
+
+بعد از شارژ موفق، می‌توانی دوباره پرداخت را با کیف پول انجام دهی.
+""",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💳 افزایش موجودی کیف پول", callback_data="wallet_topup")],
+                    [InlineKeyboardButton("↩️ بازگشت به فروشگاه", callback_data="buy")]
+                ])
             )
             return
 
@@ -1523,19 +1541,20 @@ async def callbacks(
 
         await q.edit_message_text(
             """
-💰 <b>شارژ کیف پول</b>
+<b>✦ Kaletek</b>
 
+💳 <b>شارژ کیف پول</b>
 ━━━━━━━━━━━━━━━━━━
 
-مبلغی که می‌خواهی به کیف پولت اضافه شود را به تومان وارد کن.
+💰 مبلغ موردنظر برای شارژ کیف پول را به تومان وارد کن.
 
 مثال:
-
 <code>500000</code>
 
 ━━━━━━━━━━━━━━━━━━
 
-⚠️ فقط عدد مبلغ را ارسال کن.
+🔹 فقط عدد مبلغ را ارسال کن.
+🔹 حداقل مبلغ شارژ: <b>۱٬۰۰۰ تومان</b>
 """,
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
@@ -1571,14 +1590,17 @@ async def callbacks(
 
         await q.message.reply_text(
             f"""
-📤 <b>ارسال رسید شارژ کیف پول</b>
+<b>✦ Kaletek</b>
 
+📤 <b>ارسال رسید شارژ کیف پول</b>
 ━━━━━━━━━━━━━━━━━━
 
-💰 مبلغ:
-<b>{format_price(amount)}</b>
+💰 <b>مبلغ شارژ</b>
+{format_price(amount)} تومان
 
-لطفاً عکس رسید پرداخت را همینجا ارسال کن.
+📸 لطفاً تصویر واضح رسید پرداخت را همینجا ارسال کن.
+
+🔎 بعد از دریافت، رسید برای بررسی ادمین ارسال می‌شود.
 """,
             parse_mode=ParseMode.HTML
         )
@@ -2441,17 +2463,18 @@ async def callbacks(
             await context.bot.send_message(
                 chat_id=deposit["user_id"],
                 text=f"""
-✅ <b>شارژ کیف پول تأیید شد</b>
+<b>✦ Kaletek</b>
 
+✅ <b>شارژ کیف پول با موفقیت تأیید شد</b>
 ━━━━━━━━━━━━━━━━━━
 
-💰 مبلغ اضافه‌شده:
-<b>{format_price(deposit['amount'])}</b>
+💰 <b>مبلغ اضافه‌شده</b>
+{format_price(deposit['amount'])} تومان
 
-💳 موجودی جدید:
-<b>{format_price(new_balance)}</b>
+💳 <b>موجودی جدید کیف پول</b>
+{format_price(new_balance)} تومان
 
-مبلغ با موفقیت به کیف پول شما اضافه شد.
+🎉 مبلغ با موفقیت به کیف پولت اضافه شد و اکنون قابل استفاده است.
 """,
                 parse_mode=ParseMode.HTML
             )
