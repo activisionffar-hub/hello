@@ -1,10 +1,19 @@
 
+import os
+import re
 import sqlite3
 import secrets
 from datetime import datetime, timedelta
 from html import escape
 
 import jdatetime
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None
+    RealDictCursor = None
 
 from telegram import (
     Update,
@@ -34,7 +43,8 @@ BOT_TOKEN = "8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g"
 
 ADMIN_ID = 8815017184
 SUPPORT_USERNAME = "@kaletek_Support"
-DB_PATH = "bot.db"
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
 # شماره کارت و نام صاحب کارت را اینجا وارد کن
 CARD_NUMBER = "5892 1014 0005 4561"
@@ -141,27 +151,166 @@ def create_direct_order(user_id, tier, gb):
 # DATABASE
 # =========================================================
 
+POSTGRES_ID_TABLES = {
+    "referral_rewards",
+    "services",
+    "orders",
+    "payment_receipts",
+    "wallet_deposits",
+    "wallet_transactions",
+}
+
+
+class PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+
+    @staticmethod
+    def _translate(sql):
+        sql = sql.replace("?", "%s")
+        if "INSERT OR IGNORE INTO" in sql.upper():
+            sql = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", sql, flags=re.I)
+            if "ON CONFLICT" not in sql.upper():
+                sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        return sql
+
+    def execute(self, sql, params=None):
+        translated = self._translate(sql)
+        self.lastrowid = None
+        upper = translated.lstrip().upper()
+        should_return_id = False
+        if upper.startswith("INSERT INTO") and "RETURNING" not in upper:
+            m = re.match(r"INSERT\s+INTO\s+([A-Za-z_][A-Za-z0-9_]*)", translated, flags=re.I)
+            should_return_id = bool(m and m.group(1).lower() in POSTGRES_ID_TABLES)
+            if should_return_id:
+                translated = translated.rstrip().rstrip(";") + " RETURNING id"
+        self._cursor.execute(translated, params)
+        if should_return_id:
+            row = self._cursor.fetchone()
+            if row:
+                self.lastrowid = row["id"]
+        return self
+
+    def executemany(self, sql, seq):
+        self._cursor.executemany(self._translate(sql), seq)
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class PostgresConnection:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def cursor(self):
+        return PostgresCursor(self._conn.cursor(cursor_factory=RealDictCursor))
+
+    def execute(self, sql, params=None):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
 def db():
+    if DATABASE_URL:
+        if psycopg2 is None:
+            raise RuntimeError("برای استفاده از PostgreSQL، پکیج psycopg2-binary را نصب کن.")
+        return PostgresConnection(psycopg2.connect(DATABASE_URL))
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
 
 def ensure_column(con, table, column, definition):
-    columns = [
-        row["name"]
-        for row in con.execute(
-            f"PRAGMA table_info({table})"
-        ).fetchall()
-    ]
+    if DATABASE_URL:
+        exists = con.execute(
+            "SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name=? AND column_name=?",
+            (table, column)
+        ).fetchone()
+        if not exists:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        return
 
+    columns = [row["name"] for row in con.execute(f"PRAGMA table_info({table})").fetchall()]
     if column not in columns:
-        con.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )
+        con.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
+
+def init_postgres_db():
+    con = db()
+    try:
+        statements = [
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY, username TEXT, first_name TEXT,
+                ref_code TEXT UNIQUE, referred_by BIGINT, created_at TEXT NOT NULL,
+                wallet_balance BIGINT DEFAULT 0, referral_gb_balance INTEGER DEFAULT 0
+            )""",
+            """CREATE TABLE IF NOT EXISTS referral_rewards (
+                id BIGSERIAL PRIMARY KEY, inviter_id BIGINT NOT NULL,
+                invited_user_id BIGINT UNIQUE NOT NULL, reward_gb INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )""",
+            """CREATE TABLE IF NOT EXISTS services (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, code TEXT UNIQUE NOT NULL,
+                plan_key TEXT NOT NULL, config TEXT NOT NULL, total_gb INTEGER NOT NULL,
+                used_gb DOUBLE PRECISION DEFAULT 0, expires_at TEXT NOT NULL,
+                purchased_at TEXT NOT NULL, active INTEGER DEFAULT 1, config_name TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS orders (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, plan_key TEXT NOT NULL,
+                amount BIGINT NOT NULL, status TEXT DEFAULT 'pending', created_at TEXT NOT NULL,
+                config_name TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS payment_receipts (
+                id BIGSERIAL PRIMARY KEY, order_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
+                amount BIGINT NOT NULL, file_id TEXT NOT NULL, status TEXT DEFAULT 'pending',
+                admin_id BIGINT, created_at TEXT NOT NULL, reviewed_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS wallet_deposits (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, amount BIGINT NOT NULL,
+                receipt_file_id TEXT NOT NULL, status TEXT DEFAULT 'pending', admin_id BIGINT,
+                created_at TEXT NOT NULL, reviewed_at TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS wallet_transactions (
+                id BIGSERIAL PRIMARY KEY, user_id BIGINT NOT NULL, amount BIGINT NOT NULL,
+                type TEXT NOT NULL, reference_id BIGINT, description TEXT, created_at TEXT NOT NULL
+            )""",
+        ]
+        for statement in statements:
+            con.execute(statement)
+        ensure_column(con, "users", "wallet_balance", "BIGINT DEFAULT 0")
+        ensure_column(con, "users", "referral_gb_balance", "INTEGER DEFAULT 0")
+        ensure_column(con, "services", "config_name", "TEXT")
+        ensure_column(con, "orders", "config_name", "TEXT")
+        con.commit()
+    finally:
+        con.close()
 
 def init_db():
+    if DATABASE_URL:
+        init_postgres_db()
+        return
     con = db()
     cur = con.cursor()
 
@@ -1116,46 +1265,38 @@ def plans_menu(prefix="plan"):
 # ADMIN MENU
 # =========================================================
 
+def admin_start_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("👤 پروفایل ادمین"), KeyboardButton("➕ تحویل سرویس")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def admin_profile_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📊 آمار"), KeyboardButton("📋 سفارش‌ها")],
+            [KeyboardButton("👥 کاربران"), KeyboardButton("📦 سرویس‌ها")],
+            [KeyboardButton("💰 شارژهای کیف پول")],
+            [KeyboardButton("↩️ بازگشت")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
 def admin_menu():
+    # برای callbackهای قدیمی/پیام‌های قدیمی نگه داشته شده؛ منوی اصلی جدید Reply Keyboard است.
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "📊 آمار",
-                callback_data="admin_stats"
-            ),
-            InlineKeyboardButton(
-                "📋 سفارش‌ها",
-                callback_data="admin_orders"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "👥 کاربران",
-                callback_data="admin_users"
-            ),
-            InlineKeyboardButton(
-                "📦 سرویس‌ها",
-                callback_data="admin_services"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 شارژهای کیف پول",
-                callback_data="admin_wallet"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "➕ تحویل سرویس",
-                callback_data="admin_deliver"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🏠 پنل کاربری",
-                callback_data="home"
-            ),
-        ],
+        [InlineKeyboardButton("📊 آمار", callback_data="admin_stats"),
+         InlineKeyboardButton("📋 سفارش‌ها", callback_data="admin_orders")],
+        [InlineKeyboardButton("👥 کاربران", callback_data="admin_users"),
+         InlineKeyboardButton("📦 سرویس‌ها", callback_data="admin_services")],
+        [InlineKeyboardButton("💰 شارژهای کیف پول", callback_data="admin_wallet")],
+        [InlineKeyboardButton("➕ تحویل سرویس", callback_data="admin_deliver")],
     ])
 
 
@@ -1417,7 +1558,7 @@ async def start(
 یک گزینه را انتخاب کنید:
 """,
             parse_mode=ParseMode.HTML,
-            reply_markup=admin_menu()
+            reply_markup=admin_start_keyboard()
         )
         return
 
@@ -1458,7 +1599,7 @@ async def admin(
 یک گزینه را انتخاب کنید:
 """,
         parse_mode=ParseMode.HTML,
-        reply_markup=admin_menu()
+        reply_markup=admin_start_keyboard()
     )
 
 
@@ -3289,6 +3430,74 @@ async def photo_handler(
         return
 
 
+async def show_admin_section(update, context, section):
+    """نمایش بخش‌های ادمین با Reply Keyboard، بدون وابستگی به callback menu."""
+    con = db()
+    try:
+        if section == "admin_stats":
+            users = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            services = con.execute("SELECT COUNT(*) c FROM services").fetchone()["c"]
+            active_services = con.execute("SELECT COUNT(*) c FROM services WHERE active=1").fetchone()["c"]
+            orders = con.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
+            pending = con.execute("SELECT COUNT(*) c FROM orders WHERE status IN ('pending','receipt_pending')").fetchone()["c"]
+            paid = con.execute("SELECT COUNT(*) c FROM orders WHERE status='paid'").fetchone()["c"]
+            pending_wallet = con.execute("SELECT COUNT(*) c FROM wallet_deposits WHERE status='pending'").fetchone()["c"]
+            total_wallet = con.execute("SELECT COALESCE(SUM(wallet_balance),0) total FROM users").fetchone()["total"]
+            text = f"""📊 <b>آمار فروشگاه</b>
+
+━━━━━━━━━━━━━━━━━━
+
+👥 کاربران: <b>{users}</b>
+📦 کل سرویس‌ها: <b>{services}</b>
+🟢 سرویس‌های فعال: <b>{active_services}</b>
+🧾 کل سفارش‌ها: <b>{orders}</b>
+💳 پرداخت‌شده: <b>{paid}</b>
+⏳ در انتظار رسید سفارش: <b>{pending}</b>
+💰 درخواست شارژ در انتظار: <b>{pending_wallet}</b>
+💵 مجموع موجودی کیف پول: <b>{format_price(total_wallet)}</b>"""
+        elif section == "admin_orders":
+            rows = con.execute("SELECT id,user_id,plan_key,amount,status,created_at FROM orders ORDER BY id DESC LIMIT 15").fetchall()
+            if not rows:
+                text = "📋 <b>سفارش‌ها</b>\n\n📭 هنوز سفارشی ثبت نشده."
+            else:
+                lines=["📋 <b>آخرین سفارش‌ها</b>","━━━━━━━━━━━━━━━━━━"]
+                for row in rows:
+                    plan=get_plan(row["plan_key"]) or {"name":row["plan_key"]}
+                    lines.append(f"🧾 <b>#{row['id']}</b>\n👤 <code>{row['user_id']}</code>\n⚡ {escape(plan['name'])}\n💰 {format_price(row['amount'])}\n📌 وضعیت: {escape(row['status'])}\n━━━━━━━━━━━━━━━━━━")
+                text="\n".join(lines)
+        elif section == "admin_users":
+            rows=con.execute("SELECT user_id,username,first_name,wallet_balance,created_at FROM users ORDER BY created_at DESC LIMIT 15").fetchall()
+            total=con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+            lines=[f"👥 <b>کاربران</b> — مجموع: {total}","━━━━━━━━━━━━━━━━━━"]
+            for row in rows:
+                username=f"@{row['username']}" if row["username"] else "بدون یوزرنیم"
+                lines.append(f"👤 {escape(row['first_name'] or 'بدون نام')}\n🆔 <code>{row['user_id']}</code>\n🔗 {escape(username)}\n💰 {format_price(row['wallet_balance'] or 0)}\n━━━━━━━━━━━━━━━━━━")
+            text="\n".join(lines)
+        elif section == "admin_services":
+            rows=con.execute("SELECT id,user_id,code,plan_key,expires_at,active FROM services ORDER BY id DESC LIMIT 15").fetchall()
+            total=con.execute("SELECT COUNT(*) c FROM services").fetchone()["c"]
+            lines=[f"📦 <b>سرویس‌ها</b> — مجموع: {total}","━━━━━━━━━━━━━━━━━━"]
+            for row in rows:
+                plan=get_plan(row["plan_key"]) or {"name":row["plan_key"]}
+                status="🟢 فعال" if row["active"] else "🔴 غیرفعال"
+                lines.append(f"🛰 {escape(plan['name'])}\n👤 <code>{row['user_id']}</code>\n🔑 <code>{escape(str(row['code']))}</code>\n{status}\n📅 {jalali_date(row['expires_at'])}\n━━━━━━━━━━━━━━━━━━")
+            text="\n".join(lines)
+        elif section == "admin_wallet":
+            rows=con.execute("SELECT id,user_id,amount,status,created_at FROM wallet_deposits ORDER BY id DESC LIMIT 15").fetchall()
+            if not rows:
+                text="💰 <b>شارژهای کیف پول</b>\n\n📭 هنوز درخواست شارژی ثبت نشده."
+            else:
+                lines=["💰 <b>آخرین شارژهای کیف پول</b>","━━━━━━━━━━━━━━━━━━"]
+                for row in rows:
+                    lines.append(f"💳 <b>#{row['id']}</b>\n👤 <code>{row['user_id']}</code>\n💵 {format_price(row['amount'])}\n📌 {escape(row['status'])}\n━━━━━━━━━━━━━━━━━━")
+                text="\n".join(lines)
+        else:
+            return
+    finally:
+        con.close()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=admin_profile_keyboard())
+
+
 # =========================================================
 # TEXT HANDLER
 # =========================================================
@@ -3307,6 +3516,11 @@ async def text_handler(
     if (
         user_id == ADMIN_ID
         and context.user_data.get("awaiting_delivery")
+        and text not in {
+            "👤 پروفایل ادمین", "➕ تحویل سرویس", "📊 آمار",
+            "📋 سفارش‌ها", "👥 کاربران", "📦 سرویس‌ها",
+            "💰 شارژهای کیف پول", "↩️ بازگشت"
+        }
     ):
         raw = text
         parts = raw.split("|", 2)
@@ -3421,11 +3635,84 @@ async def text_handler(
         return
 
     # =====================================================
-    # ADMIN SHOULD NOT USE USER PANEL
+    # ADMIN REPLY KEYBOARD
     # =====================================================
 
     if user_id == ADMIN_ID:
-        return
+        if text == "👤 پروفایل ادمین":
+            context.user_data["awaiting_delivery"] = False
+            await update.message.reply_text(
+                """
+👤 <b>پروفایل ادمین</b>
+
+━━━━━━━━━━━━━━━━━━
+
+به بخش مدیریت فروشگاه خوش آمدی.
+از منوی زیر بخش موردنظر را انتخاب کن.
+""",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_profile_keyboard(),
+            )
+            return
+
+        if text == "↩️ بازگشت":
+            context.user_data["awaiting_delivery"] = False
+            await update.message.reply_text(
+                "👑 <b>پنل اصلی ادمین</b>\n\nدو گزینه اصلی را انتخاب کن:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_start_keyboard(),
+            )
+            return
+
+        if text == "➕ تحویل سرویس":
+            context.user_data["awaiting_delivery"] = True
+            context.user_data["awaiting_receipt_order_id"] = None
+            context.user_data["awaiting_wallet_amount"] = False
+            context.user_data["awaiting_wallet_receipt"] = False
+            await update.message.reply_text(
+                """
+➕ <b>تحویل دستی سرویس</b>
+
+━━━━━━━━━━━━━━━━━━
+
+در پیام بعدی دقیقاً این قالب را بفرست:
+
+<code>USER_ID|PLAN_KEY|CONFIG</code>
+
+مثال:
+<code>123456789|p50|vless://...</code>
+
+━━━━━━━━━━━━━━━━━━
+
+پلن‌ها:
+<code>p50</code> → 50 گیگ
+<code>p100</code> → 100 گیگ
+<code>p200</code> → 200 گیگ
+
+برای لغو و برگشت، «↩️ بازگشت» را بزن.
+""",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_start_keyboard(),
+            )
+            return
+
+        admin_actions = {
+            "📊 آمار": "admin_stats",
+            "📋 سفارش‌ها": "admin_orders",
+            "👥 کاربران": "admin_users",
+            "📦 سرویس‌ها": "admin_services",
+            "💰 شارژهای کیف پول": "admin_wallet",
+        }
+        if text in admin_actions:
+            # برای جلوگیری از دوباره‌کاری، همان منطق callback موجود را اجرا می‌کنیم.
+            await show_admin_section(update, context, admin_actions[text])
+            return
+
+        # اگر در حالت تحویل دستی هستیم، اجازه بده متن به بخش delivery برسد.
+        if context.user_data.get("awaiting_delivery"):
+            pass
+        else:
+            return
 
     ensure_user(update.effective_user)
 
