@@ -39,7 +39,7 @@ from telegram.ext import (
 # CONFIG
 # =========================================================
 
-BOT_TOKEN = "8952875701:AAFZacIec2YPSIkA2K9vSFxnnbRdNiZb59g"
+BOT_TOKEN = "8407161370:AAHcDTXcwSKcLdK8n0L9X32eghZ5X_zjOG8"
 
 ADMIN_ID = 8815017184
 SUPPORT_USERNAME = "@kaletek_Support"
